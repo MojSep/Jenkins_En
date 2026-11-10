@@ -1,0 +1,1761 @@
+﻿Jenkins Production Cheat Sheet for DevOps Engineers
+
+    Audience: DevOps/SRE engineers running Jenkins LTS (2.4xx / 2.46x, Java 17/21) in production on Linux, Docker, or Kubernetes. Every command is copy-paste ready; every file path is the production default.
+
+Table of Contents
+
+    Architecture & Core Concepts
+
+    Critical Paths & Files
+
+    Installation Quick Reference
+
+    Service Management (systemd / Docker / K8s)
+
+    Configuration — XML, JCasC, CLI
+
+    REST API & CLI Cheat Sheet
+
+    Pipeline Patterns for Production
+
+    Credentials & Secrets Management
+
+    Agents & Kubernetes Integration
+
+    Security Hardening Checklist
+
+    Backup / Restore / DR
+
+    Performance Tuning (JVM, Disk, Concurrency)
+
+    Monitoring & Alerting
+
+    Upgrade & Rollback Procedures
+
+    Troubleshooting Playbook
+
+    Daily/Weekly/Monthly Ops Checklists
+
+    Reference Tables (ports, env vars, URLs, plugin IDs)
+
+1. Architecture & Core Concepts
+1.1 Component model
+text
+
+┌──────────────────────────────────────────────────────────────────┐
+│                        Reverse Proxy (nginx/ALB)                 │
+│                        TLS termination, :443                     │
+└─────────────────────────────┬────────────────────────────────────┘
+                              │ X-Forwarded-*
+                              ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Jenkins Controller (JVM)                      │
+│  :8080 (HTTP, loopback)   :50000 (JNLP agents)                   │
+│  $JENKINS_HOME = /var/lib/jenkins                                │
+│  numExecutors: 0  ← controller builds NOTHING                    │
+└─────────┬───────────────────────────────┬────────────────────────┘
+          │                               │
+   ┌──────▼───────┐  ┌─────────────┐  ┌──▼───────────────┐
+   │ Static agent │  │ SSH agent   │  │ K8s dynamic pods │
+   │ (VM)         │  │ (VM)        │  │ (namespace)      │
+   └──────────────┘  └─────────────┘  └──────────────────┘
+
+Golden rules:
+
+    Controller: numExecutors: 0 — never build on the controller in production.
+
+    Agents scale; controller stays stable.
+
+    All state on $JENKINS_HOME — back it up.
+
+    Secrets encrypted with secret.key — never lose it.
+
+1.2 Execution flow
+text
+
+Webhook/Poll → Queue → Executor (agent) → Build → Post-build → Archive/Notify
+                 │                          │
+                 └─ throttled by            └─ durable task (survives restart)
+                    numExecutors
+
+1.3 Key concepts cheat
+Term	Meaning
+Controller	Main Jenkins process; serves UI + API; orchestrates
+Agent	Executor machine (VM, container, pod) that runs builds
+Executor	Thread slot on an agent that runs one build at a time
+Workspace	Per-job per-agent dir ($JENKINS_HOME/workspace/<job> on controller)
+Pipeline	Groovy DSL defining build stages (Declarative or Scripted)
+Multibranch	Auto-discovers branches + PRs from SCM
+Shared Library	Reusable Groovy code (@Library('name'))
+Credentials	Encrypted store; referenced by id
+Global Tool	Managed JDK/Maven/Node/etc. installed per-agent
+Cloud	Agent provisioner (Kubernetes, Docker, EC2, Azure)
+2. Critical Paths & Files
+2.1 $JENKINS_HOME layout
+text
+
+$JENKINS_HOME/                                    # default /var/lib/jenkins
+├── config.xml                                    # global system config
+├── credentials.xml                               # encrypted credentials store
+├── secret.key                                    # ★ master AES key
+├── secret.key.not-so-secret                      # HMAC salt
+├── identity.key.enc                              # ★ instance RSA key
+├── hudson.model.UpdateCenter.xml                 # update site URL
+├── jenkins.model.JenkinsLocationConfiguration.xml # Jenkins URL + admin email
+├── jenkins.security.csrf.GlobalCrumbIssuerConfiguration.xml
+├── jenkins.CLI.xml                               # CLI over remoting toggle
+├── queue.xml                                     # build queue state
+├── nodeMonitors.xml
+├── jobs/
+│   └── <JOB>/
+│       ├── config.xml                            # job definition
+│       ├── nextBuildNumber
+│       ├── builds/<N>/build.xml
+│       ├── builds/<N>/log
+│       └── workspace/
+├── nodes/<NAME>/config.xml
+├── users/<USER>/config.xml                       # profile + API tokens
+├── secrets/
+│   ├── initialAdminPassword                      # first-boot only
+│   ├── hudson.util.Secret                        # ★ encrypted master secret
+│   ├── master.key
+│   └── file-name-secrets/
+├── plugins/
+│   ├── <plugin>.hpi                              # or .jpi
+│   └── <plugin>/META-INF/
+├── updates/default.json                          # update-center cache
+├── init.groovy.d/                                # boot scripts (alphabetical)
+│   └── *.groovy
+├── fingerprints/
+├── logs/
+├── war/                                          # exploded WAR (if not --webroot)
+└── workspace/                                    # controller-side workspaces
+
+2.2 System paths outside $JENKINS_HOME
+Path	Purpose
+/etc/default/jenkins (Debian)	JENKINS_HOME, JENKINS_PORT, JAVA_ARGS, JENKINS_ARGS
+/etc/sysconfig/jenkins (RHEL legacy)	same
+/usr/lib/systemd/system/jenkins.service	systemd unit
+/etc/systemd/system/jenkins.service.d/*.conf	drop-ins (production overrides)
+/usr/share/jenkins/jenkins.war (Deb) / /usr/lib/jenkins/jenkins.war (RPM)	WAR
+/var/cache/jenkins/war/	exploded WAR (--webroot)
+/var/log/jenkins/jenkins.log	main log
+/etc/nginx/conf.d/jenkins.conf / /etc/httpd/conf.d/jenkins.conf	proxy
+/etc/ssl/certs/ / /etc/pki/tls/	TLS material
+2.3 Filesystem permissions (production baseline)
+bash
+
+chown -R jenkins:jenkins /var/lib/jenkins
+chmod 750 /var/lib/jenkins
+chmod 700 /var/lib/jenkins/secrets
+chmod 600 /var/lib/jenkins/secret.key
+chmod 600 /var/lib/jenkins/identity.key.enc
+chmod 600 /var/lib/jenkins/credentials.xml
+chmod 640 /var/lib/jenkins/config.xml
+find /var/lib/jenkins -type f -name '*.xml' -exec chmod 640 {} \;
+
+2.4 Sensitivity matrix
+File	Sensitivity	Hand-edit safe?
+secret.key, identity.key.enc, secrets/*	★ CRITICAL	❌ Never
+credentials.xml	★ CRITICAL	❌ Never — use UI/API/JCasC
+config.xml	High	⚠️ Only with Jenkins stopped + reload
+jobs/*/config.xml	Medium	✅ With reload, or via API
+nodes/*/config.xml	Medium	⚠️ Restart / UI
+jenkins.yaml (JCasC)	High	✅ Version-controlled, hot reload
+init.groovy.d/*.groovy	High	✅ Review carefully — runs as SYSTEM
+hudson.model.UpdateCenter.xml	Medium	✅ Restart
+3. Installation Quick Reference
+3.1 Debian/Ubuntu (online)
+bash
+
+sudo apt-get update && sudo apt-get install -y fontconfig openjdk-17-jre-headless
+sudo mkdir -p /etc/apt/keyrings
+sudo wget -O /etc/apt/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" \
+  | sudo tee /etc/apt/sources.list.d/jenkins.list
+sudo apt-get update && sudo apt-get install -y jenkins
+sudo systemctl enable --now jenkins
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+3.2 RHEL/Rocky/Alma (online)
+bash
+
+sudo dnf install -y fontconfig java-17-openjdk-headless
+sudo wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+sudo dnf install -y jenkins
+sudo systemctl enable --now jenkins
+
+3.3 Docker (pinned)
+bash
+
+docker volume create jenkins_home
+docker run -d --name jenkins --restart=on-failure \
+  -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home \
+  -v /etc/localtime:/etc/localtime:ro \
+  -e TZ=Asia/Tehran \
+  -e JAVA_OPTS="-Xms2g -Xmx4g -Djava.awt.headless=true" \
+  --ulimit nofile=65536:65536 \
+  jenkins/jenkins:2.479.1-lts-jdk17
+
+3.4 Kubernetes (Helm)
+bash
+
+helm repo add jenkins https://charts.jenkins.io && helm repo update
+kubectl create ns jenkins
+kubectl -n jenkins create secret generic jenkins-admin \
+  --from-literal=jenkins-admin-user=admin \
+  --from-literal=jenkins-admin-password="$(openssl rand -base64 24)"
+helm upgrade --install jenkins jenkins/jenkins -n jenkins \
+  --set controller.admin.existingSecret=jenkins-admin \
+  --set controller.image.tag=2.479.1 \
+  --set persistence.size=50Gi --atomic --timeout 15m
+
+3.5 Offline (air-gap) — one-liner
+bash
+
+# staging (online)
+curl -fsSLO https://get.jenkins.io/war-stable/2.479.1/jenkins.war
+curl -fsSL -o jenkins-plugin-manager.jar \
+  https://github.com/jenkinsci/plugin-installation-manager-tool/releases/latest/download/jenkins-plugin-manager.jar
+printf '%s\n' configuration-as-code kubernetes workflow-aggregator git \
+  credentials-binding role-strategy ldap script-security junit warnings-ng \
+  slack timestamper build-timeout ws-cleanup prometheus > plugins.txt
+java -jar jenkins-plugin-manager.jar --war jenkins.war --plugin-file plugins.txt \
+  --plugin-download-directory ./plugins --latest false --clean-target-dir
+tar czf offline.tgz jenkins.war plugins/
+
+# target (offline)
+tar xzf offline.tgz
+sudo cp jenkins.war /opt/jenkins/ && sudo -u jenkins cp plugins/*.hpi /var/lib/jenkins/plugins/
+sudo chown -R jenkins:jenkins /var/lib/jenkins/plugins /opt/jenkins
+sudo systemctl enable --now jenkins
+
+3.6 Pin version (production requirement)
+bash
+
+# Debian
+sudo apt-get install -y jenkins=2.479.1 && sudo apt-mark hold jenkins
+# RHEL
+sudo dnf install -y jenkins-2.479.1-1.1 && sudo dnf versionlock add jenkins
+# Docker
+# use jenkins/jenkins:2.479.1-lts-jdk17 or @sha256:...
+
+4. Service Management
+4.1 systemd — production unit drop-in
+
+/etc/systemd/system/jenkins.service.d/override.conf:
+ini
+
+[Service]
+Environment="JAVA_OPTS=-Xms2g -Xmx4g -XX:MaxMetaspaceSize=1g \
+  -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/jenkins/ \
+  -Djava.awt.headless=true -Duser.timezone=Asia/Tehran -Dfile.encoding=UTF-8 \
+  -Djenkins.model.Jenkins.logStartupPerformance=true \
+  -Dhudson.lifecycle=hudson.lifecycle.ExitLifecycle"
+Environment="JENKINS_HOME=/var/lib/jenkins"
+Environment="JENKINS_OPTS=--httpListenAddress=127.0.0.1 --httpPort=8080 --webroot=/var/cache/jenkins/war"
+ExecStart=
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /usr/share/jenkins/jenkins.war $JENKINS_OPTS
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+TimeoutStartSec=600
+TimeoutStopSec=120
+LimitNOFILE=65536
+LimitNPROC=65536
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/jenkins /var/log/jenkins /var/cache/jenkins
+
+bash
+
+sudo systemctl daemon-reload && sudo systemctl restart jenkins
+systemctl show jenkins | grep -Ei 'execstart|environment|limit'
+
+4.2 Operational commands
+Task	Command
+Status	systemctl status jenkins --no-pager
+Start / stop / restart	systemctl {start|stop|restart} jenkins
+Logs (journal)	journalctl -u jenkins -f
+Logs (file)	tail -F /var/log/jenkins/jenkins.log
+Test config	java -jar /usr/share/jenkins/jenkins.war --version
+Reload XML	curl -u admin:$TOKEN -X POST http://localhost:8080/reload
+Safe restart	curl -u admin:$TOKEN -X POST http://localhost:8080/safeRestart
+Quiet down	curl -u admin:$TOKEN -X POST http://localhost:8080/quietDown
+Cancel quiet	curl -u admin:$TOKEN -X POST http://localhost:8080/cancelQuietDown
+Health	curl -fsS -o /dev/null -w '%{http_code}\n' http://localhost:8080/login
+4.3 Docker / Podman
+bash
+
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+docker logs -f --tail 200 jenkins
+docker restart jenkins
+docker exec -it --user jenkins jenkins bash
+docker inspect jenkins --format '{{.State.Health.Status}}'
+
+# Podman rootless
+podman run -d --name jenkins -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home:Z --userns=keep-id \
+  docker.io/jenkins/jenkins:2.479.1-lts-jdk17
+
+4.4 Kubernetes
+bash
+
+kubectl -n jenkins get pods -l app.kubernetes.io/component=jenkins-controller
+kubectl -n jenkins logs -f sts/jenkins --tail=200
+kubectl -n jenkins exec -it sts/jenkins -- cat /var/jenkins_home/secrets/initialAdminPassword
+kubectl -n jenkins rollout restart sts/jenkins
+kubectl -n jenkins rollout status sts/jenkins --timeout=10m
+
+5. Configuration
+5.1 JCasC — production jenkins.yaml
+
+$JENKINS_HOME/jenkins.yaml (or set CASC_JENKINS_CONFIG=/etc/jenkins/jenkins.yaml):
+yaml
+
+jenkins:
+  systemMessage: "Managed by JCasC — do not edit via UI"
+  numExecutors: 0
+  mode: NORMAL
+  quietPeriod: 5
+  scmCheckoutRetryCount: 3
+  securityRealm:
+    ldap:
+      configurations:
+        - server: "ldaps://ldap.internal:636"
+          rootDN: "dc=example,dc=com"
+          userSearchBase: "ou=people"
+          userSearch: "uid={0}"
+          groupSearchBase: "ou=groups"
+          groupSearchFilter: "(member={0})"
+          managerDN: "${LDAP_BIND_DN}"
+          managerPasswordSecret: "${LDAP_BIND_PW}"
+          inhibitInferRootDN: false
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: admin
+            permissions: ["Overall/Administer"]
+            assignments: ["admins"]
+          - name: developer
+            permissions:
+              - "Overall/Read"
+              - "Job/Build"
+              - "Job/Read"
+              - "Job/Cancel"
+              - "View/Read"
+            assignments: ["devs"]
+          - name: anonymous
+            permissions: ["Overall/Read"]
+            assignments: ["anonymous"]
+  clouds:
+    - kubernetes:
+        name: k8s
+        serverUrl: "https://kubernetes.default.svc"
+        namespace: jenkins-agents
+        jenkinsUrl: "http://jenkins.jenkins.svc:8080"
+        containerCapStr: "50"
+        podRetention: "never"
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "sonar-token"
+              description: "SonarQube API token"
+              secret: "${SONAR_TOKEN}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "nexus-push"
+              username: "${NEXUS_USER}"
+              password: "${NEXUS_PASS}"
+tools:
+  git:
+    installations:
+      - name: Default
+        home: /usr/bin/git
+  jdk:
+    installations:
+      - name: jdk17
+        home: /usr/lib/jvm/temurin-17-jdk-amd64
+unclassified:
+  location:
+    url: "https://jenkins.example.com/"
+    adminAddress: "devops@example.com"
+  timestamper:
+    allPipelines: true
+
+bash
+
+# hot reload (no restart)
+curl -u admin:$TOKEN -X POST https://jenkins.example.com/configuration-as-code/reload
+# validate only
+curl -u admin:$TOKEN https://jenkins.example.com/configuration-as-code/schema
+
+5.2 Secrets in JCasC
+bash
+
+# supply via systemd Environment or K8s Secret → env
+Environment="CASC_JENKINS_CONFIG=/etc/jenkins/jenkins.yaml"
+Environment="LDAP_BIND_DN=cn=jenkins,ou=svc,dc=example,dc=com"
+Environment="LDAP_BIND_PW=..."
+Environment="SONAR_TOKEN=..."
+Environment="NEXUS_USER=svc-jenkins"
+Environment="NEXUS_PASS=..."
+
+Prefer Vault or K8s External Secrets; JCasC interpolates ${VAR} from environment only.
+5.3 init.groovy.d/ — boot scripts
+
+$JENKINS_HOME/init.groovy.d/00-approve-signatures.groovy:
+groovy
+
+import jenkins.model.*
+import org.jenkinsci.plugins.scriptsecurity.scripts.*
+def rule = ScriptApproval.get()
+rule.approveSignature("method java.lang.String toUpperCase")
+rule.save()
+
+$JENKINS_HOME/init.groovy.d/01-disable-cli.groovy:
+groovy
+
+import jenkins.model.*
+Jenkins.get().getDescriptorByType(jenkins.CLI.DescriptorImpl).enabled = false
+
+    Scripts run alphabetically as SYSTEM. Review every script like production code.
+
+5.4 jenkins.model.JenkinsLocationConfiguration.xml
+xml
+
+<?xml version='1.1' encoding='UTF-8'?>
+<jenkins.model.JenkinsLocationConfiguration>
+  <jenkinsUrl>https://jenkins.example.com/</jenkinsUrl>
+  <adminAddress>devops@example.com</adminAddress>
+</jenkins.model.JenkinsLocationConfiguration>
+
+    Must match the external HTTPS URL exactly — otherwise OIDC/SAML redirect loops and "reverse proxy broken" warnings.
+
+5.5 hudson.model.UpdateCenter.xml — pin update site
+xml
+
+<?xml version='1.1' encoding='UTF-8'?>
+<sites>
+  <site>
+    <id>default</id>
+    <url>https://updates.jenkins.io/update-center.json</url>
+  </site>
+</sites>
+
+Offline/air-gap: point to http://mirror.internal/.../update-center.json or file:/opt/jenkins/updates/update-center.json.
+6. REST API & CLI
+6.1 Authentication
+bash
+
+# 1. Generate API token at /user/<you>/configure → "Add new Token"
+TOKEN=xxxxx
+# 2. Basic auth
+curl -u admin:$TOKEN https://jenkins.example.com/api/json
+# 3. Token in header (preferred in CI)
+curl -H "Authorization: Bearer $TOKEN" https://jenkins.example.com/api/json
+
+6.2 CSRF crumb (required for POST when CSRF enabled)
+bash
+
+CRUMB=$(curl -sS -u admin:$TOKEN https://jenkins.example.com/crumbIssuer/api/json | jq -r .crumb)
+curl -u admin:$TOKEN -H "Jenkins-Crumb: $CRUMB" -X POST https://jenkins.example.com/quietDown
+
+6.3 Common API operations
+bash
+
+BASE=https://jenkins.example.com
+AUTH="-u admin:$TOKEN"
+
+# list jobs
+curl -sS $AUTH "$BASE/api/json?tree=jobs[name,url,color]" | jq .
+
+# job info
+curl -sS $AUTH "$BASE/job/foo/api/json?tree=name,lastBuild[number,result]" | jq .
+
+# last build status
+curl -sS $AUTH "$BASE/job/foo/lastBuild/api/json?tree=number,result,duration" | jq .
+
+# console log
+curl -sS $AUTH "$BASE/job/foo/lastBuild/consoleText"
+
+# trigger build with params
+curl -sS $AUTH -X POST "$BASE/job/foo/buildWithParameters?BRANCH=main&ENV=prod"
+
+# trigger and wait (max 600s)
+curl -sS $AUTH -X POST "$BASE/job/foo/build?delay=0sec"
+# poll lastBuild until !building
+until [ "$(curl -sS $AUTH "$BASE/job/foo/lastBuild/api/json?tree=building" | jq -r .building)" = "false" ]; do sleep 5; done
+
+# create job from XML
+curl -sS $AUTH -X POST "$BASE/createItem?name=bar" \
+  -H "Content-Type: application/xml" --data-binary @job.xml
+
+# get/update job XML
+curl -sS $AUTH "$BASE/job/foo/config.xml" -o foo.xml
+curl -sS $AUTH -X POST "$BASE/job/foo/config.xml" \
+  -H "Content-Type: application/xml" --data-binary @foo.xml
+
+# copy job
+curl -sS $AUTH -X POST "$BASE/createItem?name=bar&mode=copy&from=foo"
+
+# delete job
+curl -sS $AUTH -X POST "$BASE/job/foo/doDelete"
+
+# disable/enable
+curl -sS $AUTH -X POST "$BASE/job/foo/disable"
+curl -sS $AUTH -X POST "$BASE/job/foo/enable"
+
+# queue
+curl -sS $AUTH "$BASE/queue/api/json?tree=items[id,task[name],why]" | jq .
+curl -sS $AUTH -X POST "$BASE/queue/cancelItem?id=42"
+
+# agents
+curl -sS $AUTH "$BASE/computer/api/json?tree=computer[displayName,offline,idle]" | jq .
+curl -sS $AUTH -X POST "$BASE/computer/agent-1/toggleOffline?offlineMessage=maintenance"
+
+# plugins
+curl -sS $AUTH "$BASE/pluginManager/api/json?tree=plugins[shortName,version,enabled]" | jq .
+curl -sS $AUTH "$BASE/pluginManager/api/json?tree=plugins[shortName,version,dependencies[shortName,version]]" | jq .
+
+# credentials (metadata only — secrets never returned)
+curl -sS $AUTH "$BASE/credentials/store/system/domain/_/api/json?tree=credentials[id,typeName,description]" | jq .
+
+# nodes / executors / load
+curl -sS $AUTH "$BASE/computer/api/json?tree=busyExecutors,totalExecutors" | jq .
+curl -sS $AUTH "$BASE/overallLoad/api/json" | jq .
+
+6.4 CLI (jenkins-cli.jar)
+bash
+
+curl -fsS -o /tmp/jenkins-cli.jar https://jenkins.example.com/jnlpJars/jenkins-cli.jar
+CLI="java -jar /tmp/jenkins-cli.jar -s https://jenkins.example.com -auth admin:$TOKEN"
+
+$CLI help
+$CLI who-am-i
+$CLI list-jobs
+$CLI build foo -p BRANCH=main -p ENV=prod -s -v       # -s wait, -v stream
+$CLI console foo -f                                    # follow
+$CLI reload-configuration
+$CLI safe-restart
+$CLI quiet-down --block
+$CLI cancel-quiet-down
+$CLI groovy = < script.groovy                          # script from stdin
+$CLI install-plugin sonar:2.17.2 -deploy
+$CLI list-plugins
+$CLI create-job foo < foo.xml
+$CLI update-job foo < foo.xml
+$CLI delete-job foo
+$CLI copy-job foo bar
+$CLI get-job foo
+
+    Disable CLI over remoting in production unless needed: $JENKINS_HOME/jenkins.CLI.xml → <enabled>false</enabled>.
+
+6.5 Script Console (RCE — admin only)
+groovy
+
+// /script — sample one-liners
+
+// list jobs with disabled state
+Jenkins.instance.getAllItems(Job).each { println "${it.fullName} disabled=${it.disabled}" }
+
+// trigger GC
+System.gc()
+
+// list credentials (metadata only)
+com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+  com.cloudbees.plugins.credentials.common.StandardCredentials,
+  Jenkins.instance, null, null).each { println "${it.id} ${it.description}" }
+
+// thread dump
+Thread.getAllStackTraces().each { t,s -> println "=== ${t.name}"; s.each { println "  $it" } }
+
+// reload config
+Jenkins.instance.reload()
+
+// safe restart
+Jenkins.instance.restart()
+
+/scriptText — POST raw script, returns text/plain:
+bash
+
+echo 'println Jenkins.instance.version' | \
+  curl -sS -u admin:$TOKEN -X POST --data-binary @- \
+  https://jenkins.example.com/scriptText
+
+7. Pipeline Patterns
+7.1 Declarative skeleton (production-grade)
+groovy
+
+@Library('company-pipeline-lib@v1.2.3') _
+
+pipeline {
+  agent { label 'docker && linux && x86_64' }
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+    disableConcurrentBuilds()
+    skipDefaultCheckout(false)
+    durabilityHint('PERFORMANCE_OPTIMIZED')
+    ansiColor('xterm')
+  }
+  environment {
+    APP          = 'my-service'
+    REGISTRY     = 'registry.example.com'
+    IMAGE_TAG    = "${env.GIT_COMMIT.take(8)}-${env.BUILD_NUMBER}"
+  }
+  parameters {
+    choice(name: 'ENV', choices: ['dev','staging','prod'], description: 'Deploy target')
+    booleanParam(name: 'RUN_E2E', defaultValue: true, description: 'Run E2E suite')
+    string(name: 'BRANCH', defaultValue: 'main')
+  }
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+    stage('Build') {
+      steps {
+        sh '''
+          set -eu
+          ./mvnw -B -ntp clean verify -DskipTests
+        '''
+      }
+    }
+    stage('Test') {
+      parallel {
+        stage('Unit') {
+          steps { sh './mvnw -B -ntp test' }
+          post { always { junit '**/target/surefire-reports/*.xml' } }
+        }
+        stage('Static Analysis') {
+          steps { sh 'make lint' }
+          post { always { recordIssues tools: [checkStyle()] } }
+        }
+      }
+    }
+    stage('Docker Build & Push') {
+      when { branch 'main' }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'registry-push', usernameVariable: 'RU', passwordVariable: 'RP')]) {
+          sh '''
+            echo "$RP" | docker login -u "$RU" --password-stdin "$REGISTRY"
+            docker build -t "$REGISTRY/$APP:$IMAGE_TAG" .
+            docker push "$REGISTRY/$APP:$IMAGE_TAG"
+          '''
+        }
+      }
+    }
+    stage('Deploy') {
+      when { expression { params.ENV != 'prod' || currentBuild.upstreamBuilds } }
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig-prod', variable: 'KCFG')]) {
+          sh 'KUBECONFIG=$KCFG kubectl --namespace "$ENV" set image deploy/$APP app=$REGISTRY/$APP:$IMAGE_TAG'
+        }
+      }
+    }
+  }
+  post {
+    success { slackSend channel: '#ci', color: 'good', message: "OK ${env.JOB_NAME} #${env.BUILD_NUMBER}" }
+    failure { slackSend channel: '#ci', color: 'danger', message: "FAIL ${env.JOB_NAME} #${env.BUILD_NUMBER} ${env.BUILD_URL}" }
+    always  { cleanWs() }
+  }
+}
+
+7.2 Common step snippets
+groovy
+
+// stash / unstash across stages/agents
+stash name: 'build', includes: 'target/*.jar'
+unstash 'build'
+
+// archive artifacts
+archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+
+// credentials
+withCredentials([
+  string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN'),
+  usernamePassword(credentialsId: 'nexus', usernameVariable: 'U', passwordVariable: 'P'),
+  file(credentialsId: 'kubeconfig-prod', variable: 'KCFG'),
+  sshUserPrivateKey(credentialsId: 'deploy-key', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')
+]) { sh '...' }
+
+// ssh agent
+sshagent(['deploy-key']) {
+  sh 'ssh -o StrictHostKeyChecking=yes deploy@host "systemctl restart app"'
+}
+
+// docker inside a container
+docker.image('node:20').inside('-v /tmp:/tmp') { sh 'node -v' }
+
+// docker build/push
+docker.withRegistry('https://registry.example.com', 'registry-push') {
+  def img = docker.build("myapp:${env.BUILD_NUMBER}")
+  img.push()
+  img.push('latest')
+}
+
+// K8s pod template
+podTemplate(
+  label: 'k8s-build',
+  yaml: '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: maven
+    image: maven:3.9-eclipse-temurin-17
+    command: ['cat']
+    tty: true
+    resources: { requests: { cpu: '1', memory: '2Gi' }, limits: { cpu: '2', memory: '4Gi' } }
+  - name: docker
+    image: docker:24-dind
+    securityContext: { privileged: true }
+    volumeMounts: [{ name: docker-graph, mountPath: /var/lib/docker }]
+  volumes:
+  - name: docker-graph
+    emptyDir: {}
+'''
+) {
+  node('k8s-build') {
+    container('maven') { sh 'mvn -v' }
+  }
+}
+
+// retry / timeout / sleep / catchError
+retry(3) { sh './flaky.sh' }
+timeout(time: 10, unit: 'MINUTES') { input message: 'Approve?', ok: 'Deploy' }
+catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') { sh './optional.sh' }
+
+// mark build
+currentBuild.description = "Deployed ${IMAGE_TAG} to ${params.ENV}"
+currentBuild.result = 'UNSTABLE'
+
+// parallel stages with failFast
+parallel(
+  'unit': { sh './test-unit.sh' },
+  'lint': { sh './lint.sh' },
+  failFast: true
+)
+
+// lock a shared resource
+lock(resource: 'prod-deploy') {
+  sh './deploy.sh'
+}
+
+// throttle parallel runs
+options { throttle(['prod-deploy']) { option('resource', 'prod-deploy') } }
+
+// read YAML / JSON from repo
+def cfg = readYaml file: 'config.yaml'
+def info = readJSON file: 'package.json'
+writeJSON file: 'out.json', json: [ok: true]
+
+// set build display name
+currentBuild.displayName = "#${env.BUILD_NUMBER} ${params.ENV}"
+
+7.3 Shared library structure
+text
+
+company-pipeline-lib/
+├── vars/
+│   ├── buildAndPush.groovy
+│   ├── deployK8s.groovy
+│   └── notify.groovy
+├── src/com/company/pipeline/
+│   └── Docker.groovy
+├── resources/
+│   └── scripts/entrypoint.sh
+└── Jenkinsfile
+
+groovy
+
+// vars/buildAndPush.groovy
+def call(String image, String tag) {
+  docker.withRegistry('https://registry.example.com', 'registry-push') {
+    def img = docker.build("${image}:${tag}")
+    img.push(); img.push('latest')
+  }
+}
+
+groovy
+
+// Jenkinsfile
+@Library('company-pipeline-lib@v1.2.3') _
+buildAndPush('my-service', env.GIT_COMMIT.take(8))
+
+Config via /manage/configure → Global Pipeline Libraries or JCasC:
+yaml
+
+unclassified:
+  globalLibraries:
+    libraries:
+      - name: company-pipeline-lib
+        defaultVersion: v1.2.3
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: https://git.example.com/ci/lib.git
+                credentialsId: git-read
+
+8. Credentials & Secrets
+8.1 Credential types
+Type	Use
+string	API tokens, passwords
+usernamePassword	registry, DB, basic auth
+sshUserPrivateKey	git/deploy keys
+file	kubeconfig, certs, service-account JSON
+certificate	PKCS#12
+secret text	any opaque token
+8.2 Adding via API (scripted, reproducible)
+groovy
+
+// /script or init.groovy.d
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.domains.*
+import com.cloudbees.plugins.credentials.impl.*
+import org.jenkinsci.plugins.plaincredentials.impl.*
+
+def store = SystemCredentialsProvider.getInstance().getStore()
+def scope = CredentialsScope.GLOBAL
+store.addCredentials(Domain.global(), new StringCredentialsImpl(scope, 'sonar-token', 'SonarQube', Secret.fromString('xxxx')))
+store.addCredentials(Domain.global(), new UsernamePasswordCredentialsImpl(scope, 'nexus', 'Nexus', 'svc', 'pass'))
+
+8.3 Reading credentials — best to worst
+groovy
+
+// ✅ best: withCredentials scoped
+withCredentials([string(credentialsId: 'sonar', variable: 'SONAR_TOKEN')]) { sh 'sonar-scanner -Dsonar.token=$SONAR_TOKEN' }
+
+// ✅ good: env binding
+environment { SONAR_TOKEN = credentials('sonar') }
+
+// ⚠️ ok in declarative, leaks via env
+env.SONAR_TOKEN
+
+// ❌ never: prints to build log
+echo credentials('sonar').toString()
+
+// ❌ never: export to a file in workspace
+sh 'echo "$SONAR_TOKEN" > .token'
+
+8.4 External secret managers (preferred)
+groovy
+
+// Vault plugin
+withVault(
+  configuration: [vaultUrl: 'https://vault.example.com', vaultCredentialId: 'vault-approle', engineVersion: 2],
+  vaultSecrets: [[path: 'secret/data/ci/sonar', engineVersion: 2, secretValues: [[envVar: 'SONAR_TOKEN', vaultKey: 'token']]]]
+) { sh 'sonar-scanner' }
+
+groovy
+
+// Kubernetes credentials provider — Credential binding from K8s Secret
+// JCasC:
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - kubernetes:
+              scope: GLOBAL
+              id: k8s-cred
+              description: "from k8s secret"
+              secretName: ci-secret
+              usernameKey: username
+              passwordKey: password
+
+9. Agents & Kubernetes
+9.1 Static SSH agent (VM)
+
+Manage → Nodes → New Node → Permanent Agent:
+
+    Remote root: /home/jenkins/agent
+
+    Labels: docker && linux && x86_64
+
+    Launch: Launch agents via SSH
+
+    Host, credentials (sshUserPrivateKey), HostKeyVerificationStrategy: KnownHostsFileVerificationStrategy
+
+Reproducible via JCasC:
+yaml
+
+jenkins:
+  nodes:
+    - permanent:
+        name: build-vm-01
+        labelString: "docker linux x86_64"
+        remoteFS: "/home/jenkins/agent"
+        numExecutors: 4
+        launcher:
+          ssh:
+            host: 10.0.0.42
+            port: 22
+            credentialsId: agent-ssh-key
+            hostKeyVerificationStrategy: "knownHostsFileVerificationStrategy"
+        retentionStrategy: "always"
+
+9.2 JNLP / WebSocket agent
+bash
+
+# on agent host
+java -jar agent.jar -url https://jenkins.example.com/ -secret $SECRET \
+  -name build-02 -workDir /home/jenkins/agent \
+  -webSocket   # through 443 — no 50000 needed
+
+Enable WebSocket launcher on the node config (avoids opening port 50000 in air-gap/firewalled environments).
+9.3 Kubernetes pod template (production)
+yaml
+
+podTemplate(
+  label: 'k8s-builder',
+  cloud: 'k8s',
+  namespace: 'jenkins-agents',
+  serviceAccount: 'jenkins-agent',
+  yamlMergeStrategy: 'merge',
+  yaml: '''
+apiVersion: v1
+kind: Pod
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+    fsGroup: 1000
+  containers:
+  - name: maven
+    image: maven:3.9-eclipse-temurin-17
+    command: ['cat']
+    tty: true
+    resources: { requests: { cpu: '1', memory: '2Gi' }, limits: { cpu: '2', memory: '4Gi' } }
+  - name: jnlp
+    image: jenkins/inbound-agent:3283.v92c105e0f819-17-jdk17
+    resources: { requests: { cpu: '100m', memory: '256Mi' }, limits: { cpu: '500m', memory: '512Mi' } }
+  - name: docker
+    image: docker:24-dind
+    securityContext: { privileged: true }
+    volumeMounts: [{ name: docker-graph, mountPath: /var/lib/docker }]
+  volumes:
+  - name: docker-graph
+    emptyDir: {}
+''') {
+  node('k8s-builder') {
+    container('maven') { sh 'mvn -v' }
+    container('docker') { sh 'docker info' }
+  }
+}
+
+9.4 Agent labels (conventions)
+text
+
+linux x86_64 docker
+linux arm64 docker
+windows x64 vs2022
+macos arm64 xcode15
+gpu nvidia
+prod-deploy                 # restricted label, only prod-deploy jobs target it
+
+Restrict prod deploys via role-strategy + folder structure, not just labels.
+10. Security Hardening
+10.1 Mandatory settings (/manage/configureSecurity/)
+
+    □
+
+    Security Realm: LDAP / OIDC / SAML (not "Jenkins' own user database" in prod)
+    □
+
+    Authorization: Role-based (or Matrix with explicit groups)
+    □
+
+    CSRF Protection: enabled
+    □
+
+    Agents → Controller access control: "Agent → Controller Access Control"
+    □
+
+    CLI over Remoting: disabled (jenkins.CLI.xml)
+    □
+
+    SSH server: disabled unless needed
+    □
+
+    JNLP port: fixed (not random) or WebSocket-only
+    □
+
+    Markup Formatter: Safe HTML (antisamy-markup-formatter)
+    □
+
+    Enable Security: ON
+    □
+
+    API token — rotate per user every 90 days
+
+10.2 systemd hardening (see §4.1)
+text
+
+UMask=0027, NoNewPrivileges, PrivateTmp, ProtectSystem=full,
+ProtectHome=yes, ReadWritePaths=/var/lib/jenkins ...
+
+10.3 Network
+bash
+
+# controller bound to loopback only
+--httpListenAddress=127.0.0.1 --httpPort=8080
+
+# JNLP port only from agent subnet
+sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=10.0.0.0/24 port port=50000 protocol=tcp accept'
+sudo firewall-cmd --reload
+# or: use WebSocket launcher, close 50000 entirely
+
+10.4 Credentials hygiene
+
+    Store secrets in Vault / AWS SM / Azure KV — bind via JCasC or withVault.
+
+    Never echo secrets; avoid env binding for secrets when withCredentials is possible.
+
+    Rotate sonar, nexus, registry, deploy keys, git tokens quarterly.
+
+    Audit credentials access: audit-trail plugin → SIEM.
+
+10.5 Reverse proxy — nginx (production)
+nginx
+
+upstream jenkins { server 127.0.0.1:8080; keepalive 32; }
+
+server {
+  listen 80; server_name jenkins.example.com;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl http2; server_name jenkins.example.com;
+  ssl_certificate     /etc/ssl/certs/jenkins.crt;
+  ssl_certificate_key /etc/ssl/private/jenkins.key;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+  client_max_body_size 500m;
+
+  location / {
+    proxy_pass         http://jenkins;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_set_header   X-Forwarded-Host  $host;
+    proxy_set_header   X-Forwarded-Port  $server_port;
+    proxy_set_header   Upgrade           $http_upgrade;
+    proxy_set_header   Connection        "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering    off;               # SSE/pipeline logs
+  }
+
+  # WebSocket agent path
+  location /tcpSlaveAgentListener/ {
+    proxy_pass http://jenkins;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+  }
+}
+
+10.6 Script Security
+
+    Never disable script-security in production.
+
+    Review scriptApproval.xml monthly:
+    bash
+
+    grep -c 'approval' /var/lib/jenkins/scriptApproval.xml
+
+    Prefer sandboxed pipeline (@NonCPS only when necessary).
+
+    Use @Library with pinned version (@v1.2.3, not @master).
+
+10.7 Regular audit
+bash
+
+# which users have Overall/Administer
+curl -sS -u admin:$TOKEN http://localhost:8080/role-strategy/strategy/getAllRoles | jq .
+
+# API tokens per user
+ls /var/lib/jenkins/users/*/tokens 2>/dev/null
+
+# script approvals
+grep -c 'signature' /var/lib/jenkins/scriptApproval.xml
+
+# disabled plugins still on disk
+curl -sS -u admin:$TOKEN http://localhost:8080/pluginManager/api/json?tree=plugins[shortName,enabled] | jq '.plugins[]|select(.enabled==false)|.shortName'
+
+# world-readable sensitive files
+find /var/lib/jenkins -perm -o+r -name '*.xml' -o -perm -o+r -name '*.key'
+
+11. Backup / Restore / DR
+11.1 What to back up (together!)
+text
+
+✓ config.xml
+✓ credentials.xml
+✓ secret.key
+✓ identity.key.enc
+✓ secrets/
+✓ jobs/
+✓ users/
+✓ nodes/
+✓ plugins/  (or plugins.txt + manifest)
+✓ hudson.model.UpdateCenter.xml
+✓ jenkins.yaml / init.groovy.d/
+✓ scriptApproval.xml
+
+11.2 Backup (hot, consistent)
+bash
+
+#!/usr/bin/env bash
+# /usr/local/bin/jenkins-backup.sh — run from cron as jenkins
+set -euo pipefail
+TS=$(date +%F_%H%M)
+DST=/var/backups/jenkins
+JH=/var/lib/jenkins
+mkdir -p "$DST"
+
+# 1. Quiet down (drain builds) — optional but recommended
+# curl -fsS -u "admin:$TOKEN" -X POST http://localhost:8080/quietDown
+# while curl -sS -u "admin:$TOKEN" http://localhost:8080/queue/api/json | grep -q '"items":\[.'; do sleep 10; done
+
+# 2. Copy state (tar preserves ownership/modes)
+tar czf "$DST/jenkins-$TS.tgz" \
+  -C "$JH" --exclude='workspace' --exclude='war' \
+  config.xml credentials.xml secret.key secret.key.not-so-secret \
+  identity.key.enc secrets/ jobs/ users/ nodes/ plugins/ \
+  hudson.model.UpdateCenter.xml init.groovy.d/ scriptApproval.xml \
+  jenkins.yaml 2>/dev/null || true
+
+# 3. Manifest
+tar tzf "$DST/jenkins-$TS.tgz" | sha256sum > "$DST/jenkins-$TS.sha256"
+
+# 4. Retention — keep 14 daily + 8 weekly
+find "$DST" -name 'jenkins-*.tgz' -mtime +30 -delete
+
+# 5. Unquiet
+# curl -fsS -u "admin:$TOKEN" -X POST http://localhost:8080/cancelQuietDown
+
+bash
+
+# cron: nightly at 02:15
+15 2 * * * jenkins /usr/local/bin/jenkins-backup.sh >> /var/log/jenkins-backup.log 2>&1
+
+11.3 Restore (disaster recovery)
+bash
+
+# 1. Stop
+sudo systemctl stop jenkins
+
+# 2. Preserve broken state for post-mortem
+sudo mv /var/lib/jenkins /var/lib/jenkins.broken.$(date +%F_%H%M)
+
+# 3. Restore
+sudo mkdir -p /var/lib/jenkins
+sudo tar xzf /var/backups/jenkins/jenkins-YYYY-MM-DD_HHMM.tgz -C /var/lib/jenkins
+sudo chown -R jenkins:jenkins /var/lib/jenkins
+
+# 4. Restore WAR/plugins to match — if plugins/ was restored, WAR must match
+#    the version Jenkins-Version in manifests expects
+sudo cp /opt/jenkins/jenkins.war /usr/share/jenkins/jenkins.war
+
+# 5. Start + verify
+sudo systemctl start jenkins
+sleep 30
+curl -fsS -o /dev/null -w '%{http_code}\n' http://localhost:8080/login
+curl -sS -u admin:$TOKEN http://localhost:8080/api/json?tree=version | jq .
+sudo grep -iE 'UnsatisfiedDependency|HudsonFailedToLoad' /var/log/jenkins/jenkins.log || echo OK
+
+# 6. Unquiet (if you quieted before backup)
+curl -sS -u admin:$TOKEN -X POST http://localhost:8080/cancelQuietDown
+
+11.4 DR test cadence
+
+    Quarterly: full restore into a staging VM with the same plugins.txt + WAR. Verify a job builds, credentials decrypt, agents connect.
+
+    Monthly: verify backup integrity — tar tzf + sha256sum -c.
+
+    Annual: simulate total controller loss; measure RTO/RPO.
+
+11.5 ThinBackup (alternative)
+
+    Manage → ThinBackup → Settings
+
+    Backup dir: /var/backups/jenkins-thin
+
+    Schedule: daily 02:00; full weekly, differential daily; verify include plugins/, jobs/, users/, nodes/, secrets/, config.xml, credentials.xml, secret.key.
+
+    Restore via Restore tab — but confirm secret.key + credentials.xml come from the same snapshot.
+
+12. Performance Tuning
+12.1 JVM (production baseline)
+text
+
+-Xms4g -Xmx4g                       # equal to avoid resizing pauses
+-XX:MaxMetaspaceSize=1g             # cap; leak detection
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/jenkins/
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:+ParallelRefProcEnabled
+-Djava.awt.headless=true
+-Duser.timezone=Asia/Tehran
+-Dfile.encoding=UTF-8
+-Dhudson.model.DirectoryBrowserSupport.CSP=   # only if htmlpublisher (prefer per-job)
+
+    -Xmx ≤ 70% of container/host memory. Controller: 4–8 GB heap is common; 16 GB only if thousands of jobs.
+
+12.2 Controller must not build
+yaml
+
+# JCasC
+jenkins:
+  numExecutors: 0
+
+12.3 Disk growth controls
+groovy
+
+// every pipeline
+options {
+  buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10', daysToKeepStr: '90'))
+}
+post { always { cleanWs() } }
+
+bash
+
+# find biggest jobs
+du -sh /var/lib/jenkins/jobs/* | sort -hr | head -20
+du -sh /var/lib/jenkins/jobs/*/builds/* | sort -hr | head -20
+du -sh /var/lib/jenkins/workspace/* | sort -hr | head -10
+
+# prune workspaces (safe when nothing is building)
+find /var/lib/jenkins/workspace -maxdepth 1 -type d -mtime +30 -print
+
+# archive is the usual culprit
+find /var/lib/jenkins/jobs -type d -name archive | xargs du -sh | sort -hr | head
+
+12.4 Queue / executor tuning
+Knob	Where	Effect
+numExecutors (per agent)	node config	More parallelism → more memory on agent
+jenkins.model.Jenkins.quietPeriod	global	Seconds before build starts (batch webhooks)
+scmCheckoutRetryCount	global	Retries SCM flakes
+disableConcurrentBuilds()	per job	Prevents race in shared env
+throttle / lock	per job	Serialize shared resources (prod deploy)
+durabilityHint('PERFORMANCE_OPTIMIZED')	per job	Fewer fsyncs — faster, at the cost of log durability on crash
+Agent labels	per job	Route to right hardware
+Cloud containerCap / instanceCap	cloud config	Prevents runaway pod/VM creation
+12.5 Startup time
+
+    -Djenkins.model.Jenkins.logStartupPerformance=true → log shows phase timings.
+
+    Set --webroot=/var/cache/jenkins/war on fast local SSD.
+
+    Disable update site (hudson.model.UpdateCenter.xml) in air-gap → faster init.
+
+    Exclude $JENKINS_HOME from AV/backup real-time scanning.
+
+    Reduce plugin count (uninstall, don't just disable).
+
+12.6 Faster pipeline durability
+groovy
+
+options {
+  durabilityHint('PERFORMANCE_OPTIMIZED')   // or MAX_SURVIVABILITY (default)
+}
+
+13. Monitoring & Alerting
+13.1 Endpoints
+Endpoint	Plugin	Purpose
+/prometheus	prometheus	JVM, executors, queue, builds
+/monitoring?format=json	monitoring	health summary
+/api/json?tree=mode,nodeName,version	core	readiness
+/login	core	liveness
+/computer/api/json	core	agent status
+/queue/api/json	core	queue depth
+/overallLoad/api/json	core	load stats
+/pluginManager/api/json	core	plugin inventory
+13.2 Prometheus scrape
+yaml
+
+scrape_configs:
+  - job_name: jenkins
+    metrics_path: /prometheus
+    scheme: https
+    basic_auth: { username: monitor, password_file: /etc/prometheus/jenkins_token }
+    static_configs: [{ targets: ["jenkins.example.com"] }]
+
+  - job_name: jenkins-blackbox
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs: [{ targets: ["https://jenkins.example.com/login"] }]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+13.3 Alert rules (starter set)
+yaml
+
+groups:
+  - name: jenkins
+    rules:
+      - alert: JenkinsDown
+        expr: up{job="jenkins"} == 0
+        for: 2m
+        labels: { severity: critical }
+      - alert: JenkinsLoginNotOK
+        expr: probe_success{job="jenkins-blackbox"} == 0
+        for: 2m
+        labels: { severity: critical }
+      - alert: JenkinsRestartLoop
+        expr: changes(jenkins_uptime_seconds[15m]) > 2
+        for: 10m
+        labels: { severity: critical }
+      - alert: JenkinsHeapHigh
+        expr: jenkins_vm_memory_heap_used_bytes / jenkins_vm_memory_heap_max_bytes > 0.9
+        for: 10m
+        labels: { severity: warning }
+      - alert: JenkinsGCThrashing
+        expr: rate(jenkins_vm_gc_time_seconds_total[5m]) > 0.5
+        for: 10m
+        labels: { severity: warning }
+      - alert: JenkinsQueueBacklog
+        expr: jenkins_queue_size_value > 20
+        for: 15m
+        labels: { severity: warning }
+      - alert: JenkinsAgentOffline
+        expr: jenkins_node_offline_value > 0
+        for: 5m
+        labels: { severity: warning }
+      - alert: JenkinsDiskLow
+        expr: node_filesystem_avail_bytes{mountpoint="/var/lib/jenkins"} / node_filesystem_size_bytes{mountpoint="/var/lib/jenkins"} < 0.15
+        for: 10m
+        labels: { severity: critical }
+      - alert: JenkinsFDHigh
+        expr: jenkins_file_descriptor_ratio > 0.85
+        for: 10m
+        labels: { severity: warning }
+
+13.4 Log alerts (Loki / ELK)
+Pattern	Alert
+OutOfMemoryError	critical
+HudsonFailedToLoad	critical
+UnsatisfiedDependencyException / requires Jenkins	warning
+AccessDeniedException	warning
+InvalidCipherTextException / Could not decrypt	critical
+Address already in use	warning
+scriptApproval additions	security
+Burst of Restarting / shutting down	critical
+14. Upgrade & Rollback
+14.1 Pre-flight
+bash
+
+# 1. Read changelog + security advisories
+# https://www.jenkins.io/changelog-stable/
+# https://www.jenkins.io/security/advisories/
+
+# 2. Check plugin compatibility for target core
+java -jar jenkins-plugin-manager.jar --war jenkins-new.war \
+  --plugin-file plugins.txt --list
+
+# 3. Confirm target Java version
+java -version  # LTS >= 2.479 requires 17 or 21
+
+# 4. Snapshot
+sudo tar czf /var/backups/jenkins-pre-upgrade-$(date +%F_%H%M).tgz -C /var/lib jenkins/
+
+14.2 Upgrade (offline-safe)
+bash
+
+# 1. Quiet down + wait
+curl -u admin:$TOKEN -X POST http://localhost:8080/quietDown
+until [ "$(curl -sS -u admin:$TOKEN 'http://localhost:8080/computer/api/json' | jq '[.computer[].executors[].currentExecutable]|map(select(.!=null))|length')" = "0" ]; do sleep 15; done
+
+# 2. Stop
+sudo systemctl stop jenkins
+
+# 3. Backup (already done in pre-flight, but redo now that nothing is changing)
+sudo tar czf /var/backups/jenkins-pre-swap-$(date +%F_%H%M).tgz -C /var/lib jenkins/
+
+# 4. Swap WAR
+sudo cp /opt/jenkins/jenkins-new.war /usr/share/jenkins/jenkins.war
+
+# 5. Swap plugins (if the new set is pinned differently)
+sudo rm -rf /var/lib/jenkins/plugins/*
+sudo -u jenkins cp /opt/jenkins/plugins-new/*.hpi /var/lib/jenkins/plugins/
+
+# 6. Start
+sudo systemctl start jenkins
+
+# 7. Wait for readiness
+for i in $(seq 1 60); do
+  curl -fsS -m 3 -u admin:$TOKEN 'http://127.0.0.1:8080/api/json?tree=mode' >/dev/null 2>&1 && break
+  sleep 5
+done
+
+# 8. Verify
+curl -sS -u admin:$TOKEN http://localhost:8080/api/json?tree=version | jq .
+sudo grep -iE 'UnsatisfiedDependency|HudsonFailedToLoad' /var/log/jenkins/jenkins.log || echo OK
+curl -u admin:$TOKEN -X POST http://localhost:8080/cancelQuietDown
+
+14.3 Rollback (fast)
+bash
+
+sudo systemctl stop jenkins
+# restore the pre-swap snapshot in one go
+sudo rm -rf /var/lib/jenkins
+sudo tar xzf /var/backups/jenkins-pre-swap-YYYY-MM-DD_HHMM.tgz -C /var/lib
+sudo chown -R jenkins:jenkins /var/lib/jenkins
+# restore matching WAR
+sudo cp /opt/jenkins/jenkins-old.war /usr/share/jenkins/jenkins.war
+sudo systemctl start jenkins
+
+Rollback is all-or-nothing — restoring plugins/ without the matching secret.key/WAR corrupts the instance.
+14.4 Upgrade cadence
+Frequency	What
+Weekly	Review security advisories; patch critical CVEs in window
+Monthly	Core LTS .1 → .2 with plugin set; 1–3 plugins per window
+Quarterly	Full plugin audit; uninstall unused; DR restore test
+Annually	Major core LTS line review (Java 17 → 21, etc.)
+15. Troubleshooting
+15.1 Five-minute triage
+bash
+
+# 1. unit / JVM / app
+systemctl status jenkins --no-pager
+journalctl -u jenkins -b --no-pager -n 200
+ps -eo pid,args | grep -i 'jenkins.war' | grep -v grep
+
+# 2. resources
+free -h; df -h /var/lib/jenkins; df -i /var/lib/jenkins
+cat /sys/fs/cgroup/memory.max 2>/dev/null
+
+# 3. ports
+ss -ltnp | grep -E ':(8080|50000)\b'
+
+# 4. permissions
+sudo -u jenkins test -w /var/lib/jenkins && echo OK || echo NOT-WRITABLE
+
+# 5. config integrity
+xmllint --noout /var/lib/jenkins/config.xml
+xmllint --noout /var/lib/jenkins/hudson.model.UpdateCenter.xml
+
+# 6. plugin failures
+grep -nE 'UnsatisfiedDependency|requires Jenkins|ClassNotFound|failed to load' \
+  /var/log/jenkins/jenkins.log | tail -50
+
+# 7. OOM
+ls -lt /var/log/jenkins/*.hprof 2>/dev/null | head
+grep -iE 'OutOfMemory|GC overhead' /var/log/jenkins/jenkins.log | tail
+
+# 8. HTTP
+curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/login
+
+15.2 Symptom → cause → fix (reference)
+Symptom	Likely cause	Fix
+Unit failed immediately	unit/env/JVM flag	journalctl -u jenkins -b -n 200; §4.1
+Hangs in activating	slow init (plugins/jobs/LDAP) or OOM	grep -i startup; raise TimeoutStartSec; find slow phase
+Unrecognized VM option	obsolete flag	remove from JAVA_OPTS
+UnsupportedClassVersionError	wrong JDK	update-alternatives --config java
+Could not reserve enough space for heap	-Xmx > RAM/cgroup	lower -Xmx, or raise cgroup limit
+AccessDeniedException	ownership / SELinux	chown -R jenkins:jenkins; ausearch -m avc
+No space left on device	disk/inodes full	df -h; df -i; purge builds/workspaces
+Address already in use	port conflict	ss -ltnp; change port
+UnsatisfiedDependencyException	missing plugin dep	re-resolve plugins.txt; swap while stopped
+requires Jenkins 2.xxx	core too old	upgrade core in window
+ClassNotFoundException	plugin skew / disabled	pluginManager/api/json
+HudsonFailedToLoad	init failed (broad)	full startup log tail
+Login always fails	LDAP/AD/OIDC/SAML	ldapsearch; check jenkinsUrl
+All users 403	role-strategy / authz	restore authz or JCasC
+Could not decrypt credentials	secret.key mismatch	restore key+creds together
+Jobs missing / red	job XML vs plugins	find jobs -name config.xml + xmllint
+reverse proxy broken	jenkinsUrl mismatch	fix JenkinsLocationConfiguration.xml
+Agents can't connect	50000 blocked / WS disabled	open port; or enable WebSocket launcher
+OOM after start	heap too small / leak	.hprof in /var/log/jenkins/; raise -Xmx
+Restart loop	failing init	StartLimitBurst + fix root cause
+15.3 Emergency admin recovery
+bash
+
+# 1. Stop
+sudo systemctl stop jenkins
+sudo cp /var/lib/jenkins/config.xml /var/backups/config.xml.$(date +%F_%H%M)
+
+# 2. Temporarily disable security (last resort only)
+sudo sed -i 's#<useSecurity>true</useSecurity>#<useSecurity>false</useSecurity>#' /var/lib/jenkins/config.xml
+sudo systemctl start jenkins
+# → log in anonymously, restore auth, re-enable, restart
+
+groovy
+
+// Alternative: init.groovy.d/00-breakglass.groovy (delete after recovery!)
+import jenkins.model.*
+import hudson.security.*
+def i = Jenkins.get()
+def realm = new HudsonPrivateSecurityRealm(false)
+realm.createAccount("breakglass","ROTATE_ME_NOW")
+i.setSecurityRealm(realm)
+i.setAuthorizationStrategy(new FullControlOnceLoggedInAuthorizationStrategy())
+i.save()
+
+    Delete the groovy file and the account after recovery. Rotate credentials.
+
+15.4 Rotate secret.key (advanced)
+
+Only when leaked. Procedure:
+bash
+
+# 1. Stop
+sudo systemctl stop jenkins
+# 2. Backup
+sudo tar czf /var/backups/jenkins-keys-$(date +%F).tgz -C /var/lib jenkins/
+# 3. Move old keys aside
+sudo mv /var/lib/jenkins/secret.key{,.old}
+sudo mv /var/lib/jenkins/identity.key.enc{,.old}
+# 4. Start — Jenkins generates a NEW secret.key, but credentials.xml ciphertext is now unreadable
+sudo systemctl start jenkins
+# 5. Re-enter every credential via UI/JCasC/Vault
+# 6. Delete old credentials.xml after re-entry
+
+Prefer migrating to Vault instead of doing this in place.
+16. Ops Checklists
+16.1 Daily
+text
+
+[ ] /login responds 200 (blackbox)
+[ ] No OutOfMemoryError / HudsonFailedToLoad in last 24h
+[ ] Disk < 85% on $JENKINS_HOME (and inodes)
+[ ] Agents online
+[ ] Queue depth < 20
+[ ] No restart loop (uptime > 15m)
+[ ] Backup ran successfully (nightly)
+
+16.2 Weekly
+text
+
+[ ] Review Jenkins security advisories; plan patch window
+[ ] Review scriptApproval.xml additions
+[ ] Review API token age (> 90d → rotate)
+[ ] Review role assignments (role-strategy)
+[ ] Purge workspaces > 30d
+[ ] Check plugin inventory drift vs git plugins.txt
+[ ] Verify backup integrity: tar tzf + sha256sum -c
+
+16.3 Monthly
+text
+
+[ ] Plugin audit — uninstall unused (not just disable)
+[ ] Core LTS patch (.1 → .2) in window with backup
+[ ] JCasC reload validation
+[ ] Heap/GC trends review; adjust -Xmx if sustained > 85%
+[ ] LDAP/OIDC/SAML cert expiry (>30d)
+[ ] TLS cert expiry (>30d)
+[ ] SSH/JNLP agent key rotation
+[ ] DR test in staging: restore backup, verify credentials decrypt
+
+16.4 Quarterly
+text
+
+[ ] Full DR restore test → measure RTO/RPO
+[ ] Rotate: registry creds, sonar token, nexus, git deploy keys
+[ ] Rotate: Vault approle credentials
+[ ] Review reverse proxy config + TLS cipher suite
+[ ] Review firewall rules (50000, 8080)
+[ ] Review Docker image digest pin / WAR version pin
+[ ] Upgrade Java if a new LTS line is available
+
+17. Reference Tables
+17.1 Ports
+Port	Purpose	Bind
+8080/tcp	HTTP	loopback (proxy)
+443/tcp	HTTPS	proxy
+50000/tcp	JNLP agents	agent subnet only (or close — use WebSocket)
+22/tcp	SSH agents	agent subnet
+8443/tcp	native HTTPS (optional)	loopback
+17.2 Env vars (systemd)
+Var	Purpose
+JENKINS_HOME	state root
+JAVA_OPTS	JVM flags
+JENKINS_OPTS	WAR flags (--httpPort, --prefix, --webroot)
+CASC_JENKINS_CONFIG	JCasC file/URL
+JENKINS_JAVA_CMD	java binary override
+JENKINS_SLAVE_AGENT_PORT	legacy agent port
+JENKINS_UC / JENKINS_UC_EXPERIMENTAL	update center URLs
+17.3 URL map
+text
+
+/                                Dashboard
+/login  /logout  /whoAmI/        Auth
+/me/  /user/<u>/                 User
+/manage/                         Manage Jenkins
+  /configure  /configureSecurity/
+  /configureTools/  /configureClouds/
+  /pluginManager/{available,installed,updates}/
+  /systemInfo  /threadDump  /cli  /script  /scriptText
+  /reload  /safeRestart  /restart  /quietDown  /cancelQuietDown
+/computer/  /computer/<agent>/   Nodes
+/computer/<agent>/script         Per-agent Groovy
+/view/<v>/                       Views
+/job/<j>/                        Job
+  /build  /buildWithParameters
+  /lastBuild  /lastSuccessfulBuild  /lastFailedBuild
+  /<n>/console  /<n>/consoleText  /<n>/api/json  /<n>/stop
+  /config.xml  /api/json  /disable  /enable  /doDelete
+  /ws/                           Workspace
+  /pipeline-syntax/              Snippet generator
+/queue/  /queue/cancelItem?id=N  Queue
+/credentials/store/system/       Credentials (metadata)
+/securityRealm/                  Realm
+/descriptorByName/<FQCN>/        Descriptor metadata
+/cli                             CLI endpoint
+/jnlpJars/{agent,jenkins-cli,remoting}.jar
+/tcpSlaveAgentListener/          JNLP port
+/prometheus                      Metrics (plugin)
+/monitoring?format=json          Health (plugin)
+/configuration-as-code/reload    JCasC reload
+/pluginManager/api/json          Plugin inventory
+/api/json  /api/xml              REST root
+/crumbIssuer/api/json            CSRF crumb
+
+17.4 Reload matrix
+Change	Reload type
+config.xml	POST /reload or restart
+jobs/*/config.xml	auto / /reload
+nodes/*/config.xml	/reload
+credentials.xml	restart
+secret.key / identity.key.enc	restart + re-encrypt
+init.groovy.d/*	restart
+plugins/*.hpi	restart
+jenkins.yaml	POST /configuration-as-code/reload
+JenkinsLocationConfiguration.xml	hot
+hudson.model.UpdateCenter.xml	restart
+17.5 Required plugins (minimum viable set)
+text
+
+workflow-aggregator
+pipeline-stage-view
+pipeline-utility-steps
+git
+github-branch-source           # or gitlab-plugin / bitbucket-branch-source
+ssh-agent
+credentials
+credentials-binding
+configuration-as-code
+role-strategy
+ldap                           # or oic-auth / saml
+script-security
+matrix-auth
+kubernetes                     # or docker-workflow
+docker-workflow
+junit
+warnings-ng
+coverage
+sonar
+slack                          # or email-ext
+timestamper
+build-timeout
+ws-cleanup
+thin-backup                    # or prometheus + external backup
+prometheus
+
+17.6 Common Groovy one-liners (/script)
+groovy
+
+// version
+println Jenkins.instance.version
+
+// list disabled jobs
+Jenkins.instance.getAllItems(Job).findAll { it.disabled }.each { println it.fullName }
+
+// trigger GC
+System.gc()
+
+// reload config from disk
+Jenkins.instance.reload()
+
+// safe restart
+Jenkins.instance.restart()
+
+// list users
+User.getAll().each { println it.id }
+
+// list agents with labels
+Jenkins.instance.computers.each { println "${it.name} ${it.node?.labelString}" }
+
+// print all executors
+Jenkins.instance.computers.each { c -> c.executors.each { e -> println "${c.name} ${e.isBusy()}" } }
+
+// find a credential by id (metadata only)
+com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+  com.cloudbees.plugins.credentials.Credentials, Jenkins.instance, null, null)
+  .findAll { it.id == 'sonar-token' }.each { println it.description }
+
+// dump script approvals
+org.jenkinsci.plugins.scriptsecurity.scripts.ScriptApproval.get().getApprovedSignatures().each { println it }
+
+// approve a signature (use sparingly)
+org.jenkinsci.plugins.scriptsecurity.scripts.ScriptApproval.get().approveSignature("method java.lang.String toUpperCase")
+
+17.7 Environment / config quick-glance
+Item	Path
+JENKINS_HOME	/var/lib/jenkins
+systemd override	/etc/systemd/system/jenkins.service.d/override.conf
+Env file (Debian)	/etc/default/jenkins
+WAR	/usr/share/jenkins/jenkins.war (Deb) / /usr/lib/jenkins/jenkins.war (RPM)
+Webroot	/var/cache/jenkins/war
+Log	/var/log/jenkins/jenkins.log
+JCasC	$JENKINS_HOME/jenkins.yaml or CASC_JENKINS_CONFIG
+Boot scripts	$JENKINS_HOME/init.groovy.d/
+Update site	$JENKINS_HOME/hudson.model.UpdateCenter.xml
+Jenkins URL	$JENKINS_HOME/jenkins.model.JenkinsLocationConfiguration.xml
+Secret key	$JENKINS_HOME/secret.key
+Credentials	$JENKINS_HOME/credentials.xml
+Script approvals	$JENKINS_HOME/scriptApproval.xml
+Plugin inventory	$JENKINS_HOME/plugins/
+Backups	/var/backups/jenkins/ (recommended)
+18. Production Golden Rules (one-page summary)
+
+    Pin everything — core WAR, plugin versions, Docker image digest, JDK.
+
+    Controller builds nothing — numExecutors: 0; workloads on agents/K8s.
+
+    JCasC is the source of truth — jenkins.yaml + plugins.txt in git.
+
+    Secrets in Vault/SM, not in credentials.xml where avoidable.
+
+    secret.key + identity.key.enc + credentials.xml are Tier-0 — back up together, never hand-edit.
+
+    script-security ON, CLI off, JNLP scoped — reduce attack surface.
+
+    Reverse proxy terminates TLS; controller on loopback.
+
+    Backup nightly; restore tested quarterly — untested backups don't exist.
+
+    Upgrade in windows: quiet → wait → backup → swap → readiness → unquiet.
+
+    Monitor /prometheus + /login + log signatures; alert on restart loops, heap, disk, HudsonFailedToLoad.
+
+    Discard builds and clean workspaces in every pipeline — disk is the #1 killer.
+
+    One change per window — bisectable rollbacks beat ambitious upgrades.
+
+    TimeoutStartSec=600 in systemd + startupProbe in K8s — never let liveness kill init.
+
+    Document the break-glass path — locked-out admin is a real outage.
+
+    Rotate API tokens, deploy keys, and TLS certs on a schedule, not on incident.
+
+This cheat sheet is intended to be pasted into your team's runbook repo (Markdown). Treat sections 4, 5, 6, 10, 11, 14, 15 as the operational core; sections 7, 8, 9 as the engineering core.

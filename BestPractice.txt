@@ -1,0 +1,1099 @@
+﻿Jenkins Production Best Practices for DevOps Engineers
+
+    Framing: The practices below are organized by domain of failure. Each is a concrete rule with the reasoning, the technical mechanism, and the verification command. They assume Jenkins LTS (2.4xx / 2.46x, Java 17/21) on Linux, whether bare-metal, VM, Docker, or Kubernetes.
+
+Part 1 — Architecture & Topology
+1.1 The controller does not build
+
+Rule: numExecutors: 0 on the controller. Always.
+
+Why: Every build on the controller consumes heap, opens executors to untrusted SCM content, and destabilizes the UI/API. The controller is a control plane; agents are the data plane.
+
+Enforce:
+yaml
+
+# JCasC
+jenkins:
+  numExecutors: 0
+
+groovy
+
+// audit in /script
+Jenkins.instance.numExecutors == 0 ?: error("controller has executors — fix JCasC")
+
+Verify:
+bash
+
+curl -sS -u admin:$TOKEN http://localhost:8080/api/json?tree=numExecutors | jq
+# {"numExecutors":0}
+
+1.2 Separate controller and agents by trust zone
+text
+
+┌───────────────────────┐         ┌──────────────────────────────┐
+│  Controller           │  :50000 │  Agent pool (trusted zone)   │
+│  127.0.0.1:8080       │◄────────│  build VMs, K8s pods, macOS  │
+│  proxy terminates TLS │  (or   │  each with its own SA / IAM  │
+└───────────────────────┘  WSS)   └──────────────────────────────┘
+
+    Controller on a private subnet, reachable only from the reverse proxy.
+
+    Agents on a subnet allowed to reach the controller's :50000 or /tcpSlaveAgentListener/.
+
+    No agent has read access to $JENKINS_HOME, secret.key, or credentials.xml.
+
+Verify agent access:
+bash
+
+# agent should NOT be able to reach the controller filesystem
+# but should be able to reach :50000 (or wss)
+nc -zv jenkins.internal 50000
+
+1.3 Folder-based tenancy
+
+    One top-level folder per team/domain: folder('team-a').
+
+    Per-folder authz via role-strategy (folder role) or matrix-auth.
+
+    Per-folder credential domains (scoped credentials).
+
+    Prevents cross-team job visibility and credential leakage.
+
+JCasC:
+yaml
+
+jenkins:
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: admin
+            permissions: ["Overall/Administer"]
+            assignments: ["admins"]
+        items:
+          - name: team-a
+            pattern: "^team-a/.*"
+            permissions: ["Job/Build", "Job/Read", "Job/Cancel", "View/Read"]
+            assignments: ["team-a-devs"]
+
+1.4 Scale-out by workload class, not by executor count
+
+    Linux container builds → Kubernetes plugin, ephemeral pods.
+
+    Windows / macOS / hardware-attached → static SSH agents with labels.
+
+    Long-lived stateful builds (FPGA, GPU, licensed tools) → dedicated permanent agents.
+
+    Never mix; label them so pipelines target the right class.
+
+1.5 No shared $JENKINS_HOME between controllers
+
+HA is active-passive (or blue/green), not active-active. $JENKINS_HOME is a single-writer store — a shared NFS $JENKINS_HOME corrupts. If you need HA, use CloudBees HA or a blue/green pair behind a proxy, with a shared read-only backup for restore.
+Part 2 — Controller Hygiene
+2.1 Pin the WAR and the JDK
+
+Rule: Never latest. Pin the WAR version, and pin the JDK (17 or 21 — both supported on LTS ≥ 2.479).
+bash
+
+# Debian
+sudo apt-get install -y jenkins=2.479.1 && sudo apt-mark hold jenkins
+# RHEL
+sudo dnf install -y jenkins-2.479.1-1.1 && sudo dnf versionlock add jenkins
+# Docker
+image: jenkins/jenkins:2.479.1-lts-jdk17   # or @sha256:<digest>
+
+Why: LTS .1 → .2 → .3 patches are compatible; jumping core lines is not. JDK 21 on LTS < 2.479 is unsupported and will fail at startup.
+2.2 Never edit $JENKINS_HOME XML by hand while Jenkins is running
+
+Jenkins caches configuration in memory and writes it back asynchronously. Hand-editing config.xml, credentials.xml, jobs/*/config.xml while the JVM is up causes the next UI save to overwrite you, or worse, partial writes at shutdown.
+
+Rule:
+File	Method
+config.xml	JCasC or UI; if hand-editing, stop Jenkins first
+credentials.xml	Credentials UI / JCasC / Vault — never hand-edit
+jobs/*/config.xml	Job DSL / POST /job/X/config.xml / create-job
+nodes/*/config.xml	UI or JCasC
+init.groovy.d/*.groovy	Fine to edit, but only at boot
+secret.key	Never edit; rotate only under documented procedure
+2.3 Keep $JENKINS_HOME on local POSIX storage
+
+Rule: Local SSD or block storage. Never NFS, CIFS, or network-attached storage.
+
+Why: Jenkins uses file locking, fsync, and rename-based atomic writes. NFS semantics break under concurrent access and cause corruption, stale locks, and silent job loss.
+
+Verify:
+bash
+
+mount | grep /var/lib/jenkins      # must be local
+df -T /var/lib/jenkins             # ext4/xfs/btrfs — not nfs/cifs
+
+2.4 Disk growth is the #1 controller killer
+
+Every pipeline must set:
+groovy
+
+options {
+  buildDiscarder(logRotator(
+    numToKeepStr: '30',
+    artifactNumToKeepStr: '10',
+    daysToKeepStr: '90'
+  ))
+}
+post { always { cleanWs() } }
+
+Per-job GC policy (global override):
+groovy
+
+// /script or init.groovy.d/10-build-discarder.groovy
+import hudson.model.*
+import hudson.tasks.LogRotator
+Jenkins.instance.getAllItems(Job).each { job ->
+  def lr = job.getBuildDiscarder()
+  if (lr == null) {
+    job.setBuildDiscarder(new LogRotator("-1", "30", "-1", "10"))
+    job.save()
+  }
+}
+
+Monitor:
+bash
+
+du -sh /var/lib/jenkins/jobs/* | sort -hr | head
+du -sh /var/lib/jenkins/jobs/*/builds/* | sort -hr | head
+du -sh /var/lib/jenkins/workspace/* | sort -hr | head
+df -i /var/lib/jenkins              # inodes too — archive/ explodes inode count
+
+Alert at 80% disk and 80% inodes. Have a purge script ready (see previous guide).
+2.5 Bound the JVM
+
+Production baseline:
+text
+
+-Xms4g -Xmx4g
+-XX:MaxMetaspaceSize=1g
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/jenkins/
+-XX:+UseG1GC
+-Djava.awt.headless=true
+
+    -Xms == -Xmx — avoids resize pauses.
+
+    -Xmx ≤ 70% of container/host memory; leave room for metaspace, OS, page cache.
+
+    MaxMetaspaceSize catches plugin classloader leaks early.
+
+    Heap dump on OOM — you'll need it 5 minutes later.
+
+Verify:
+bash
+
+ps -eo pid,args | grep jenkins.war
+curl -sS -u admin:$TOKEN http://localhost:8080/prometheus | grep -E 'heap_(used|max)'
+
+2.6 Hardened systemd unit
+ini
+
+[Service]
+User=jenkins
+Group=jenkins
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/jenkins /var/log/jenkins /var/cache/jenkins
+LimitNOFILE=65536
+LimitNPROC=65536
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+    UMask=0027 — configs not world-readable.
+
+    TimeoutStartSec=600 — never let systemd kill Jenkins mid-init.
+
+    StartLimitBurst — prevents flapping restart loops.
+
+2.7 Set the Jenkins URL correctly
+
+$JENKINS_HOME/jenkins.model.JenkinsLocationConfiguration.xml:
+xml
+
+<jenkinsUrl>https://jenkins.example.com/</jenkinsUrl>
+<adminAddress>devops@example.com</adminAddress>
+
+Why: OIDC/SAML redirect URIs, Slack links, and CSRF crumb origin checks all key off this URL. A mismatch causes login loops and "reverse proxy broken" warnings.
+Part 3 — Agent Management
+3.1 Every agent has a purpose and a label taxonomy
+
+Agreed labels (example):
+text
+
+linux x86_64 docker
+linux arm64 docker
+windows x64 vs2022
+macos arm64 xcode15
+gpu nvidia
+prod-deploy              # restricted: only prod-deploy jobs target
+
+    Pipelines target labels (agent { label 'linux && docker && x86_64' }), never specific agent names.
+
+    prod-deploy agent restricts role-strategy-protected jobs — a defense-in-depth, not the primary control.
+
+    Rotate labels when hardware changes; do not rename agents.
+
+3.2 Ephemeral agents over long-lived ones
+
+Prefer:
+
+    Kubernetes plugin — one pod per build, destroyed after. No state accumulation, no plugin drift between builds, no untrusted artifact persistence.
+
+    Docker plugin — one container per build; same benefits.
+
+    EC2/Azure/GCP plugin — VM per build; slower but isolated.
+
+Only use permanent agents for:
+
+    Licensed tools (MATLAB, Xcode, proprietary CAD).
+
+    Hardware-attached (FPGA, GPU, security tokens).
+
+    Long-lived caches where re-download is prohibitive (rare; prefer container layer cache).
+
+Verify a K8s pod is ephemeral:
+groovy
+
+podTemplate(cloud:'k8s', yaml:'''...''', podRetention: 'never') {
+  node(POD_LABEL) { /* ... */ }
+}
+
+podRetention: 'never' — pod deleted on completion regardless of outcome. (onFailure leaks on success; always leaks forever.)
+3.3 Disable agents cleanly for maintenance
+
+Never kill an agent mid-build. Use:
+bash
+
+# mark offline with reason → drains after current builds
+curl -u admin:$TOKEN -X POST \
+  'http://localhost:8080/computer/build-vm-01/toggleOffline?offlineMessage=maintenance-2026-11'
+
+Or via JCasC/script:
+groovy
+
+Jenkins.instance.getNode('build-vm-01').setTemporarilyOffline(true,
+  new OfflineCause.ByCLI("maintenance window"))
+
+3.4 Agent connection uses WebSocket when :50000 is closed
+
+Rule: If the agent subnet cannot reach controller :50000, use WebSocket launcher (wss://jenkins.example.com/) — traverses the same 443 as HTTP and works behind corporate proxies.
+
+Enable per agent: Launch method → Let Jenkins control this agent via WebSocket. Or JCasC:
+yaml
+
+launcher:
+  webSocket: {}
+
+Verify:
+bash
+
+ss -ltnp | grep 50000            # if absent and agents work → WebSocket is in use
+
+3.5 Agent JVM hygiene
+
+Agents also run JVMs — set heap limits and disable controller-bound features:
+bash
+
+JAVA_OPTS="-Xms512m -Xmx2g -XX:MaxMetaspaceSize=512m -Djava.awt.headless=true"
+
+Do not let agents read controller credentials — ensure Agent → Controller Access Control is enabled (see §5.3).
+3.6 Agent image discipline
+
+    Every agent runs from a pinned image (digest, not tag).
+
+    Base image is rebuilt monthly from upstream (security patches) and promoted through staging.
+
+    Custom images carry a label/annotation with build provenance.
+
+dockerfile
+
+FROM jenkins/inbound-agent:3283.v92c105e0f819-17-jdk17
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl jq python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+USER jenkins
+
+Part 4 — Pipeline Design
+4.1 Pipelines are code — reviewed, versioned, tested
+
+    Jenkinsfile in the repo, reviewed via PR.
+
+    Shared libraries in their own repo with semver tags.
+
+    Pipeline changes tested on a staging controller with a canary job.
+
+    Pipeline linters in CI (jenkinsfile-runner, npm-groovy-lint, pipeline-model-definition validator).
+
+Rule: No pipeline changes via the Jenkins UI. The UI is for inspection; SCM is the source of truth.
+4.2 Pin shared library versions
+groovy
+
+@Library('company-pipeline-lib@v1.2.3') _
+
+Never @master / @main in production Jenkinsfiles. The library is code that runs as SYSTEM in your builds — treat it as supply chain.
+4.3 Declarative over scripted, with options on every pipeline
+groovy
+
+pipeline {
+  agent { label 'linux && docker' }
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+    disableConcurrentBuilds()
+    skipDefaultCheckout(false)
+    durabilityHint('PERFORMANCE_OPTIMIZED')
+    ansiColor('xterm')
+  }
+  // ...
+}
+
+    timeout — no runaway builds.
+
+    buildDiscarder — disk control.
+
+    disableConcurrentBuilds — shared env safety.
+
+    durabilityHint('PERFORMANCE_OPTIMIZED') — fewer fsyncs; but pipeline state may be lost on crash. Use MAX_SURVIVABILITY (default) for jobs that must resume after controller restart.
+
+4.4 Stages are small, named, and independent
+
+    One concern per stage (Checkout, Build, Unit, Integration, Image, Deploy).
+
+    Parallel where independent (parallel { 'unit': …, 'lint': …, failFast: true }).
+
+    post { always { … } } for cleanup — never rely on the happy path.
+
+    No secrets in stage names, echo, or sh command lines — they land in the build log.
+
+4.5 Use credentials binding, never env for secrets
+groovy
+
+// ✅
+withCredentials([string(credentialsId: 'sonar', variable: 'SONAR_TOKEN')]) {
+  sh 'sonar-scanner -Dsonar.token="$SONAR_TOKEN"'
+}
+
+// ❌ environment { SONAR_TOKEN = credentials('sonar') }  // visible in env dump
+// ❌ echo credentials('sonar').toString()               // prints to log
+
+4.6 Use stash/unstash in-pipeline, copyartifact across pipelines
+
+    stash transfers between stages/agents within one build — preferred.
+
+    copyartifact between jobs — necessary, but couples jobs; prefer archiveArtifacts + a downstream download step, or an artifact repository (Nexus/Artifactory/S3).
+
+    Never share state via $JENKINS_HOME/workspace across jobs.
+
+4.7 lock / throttle for shared resources
+groovy
+
+lock(resource: 'prod-deploy') { sh './deploy.sh' }
+options { throttle(['prod-deploy']) { option('resource', 'prod-deploy') } }
+
+    lock serializes a single pipeline run at a time on a named resource.
+
+    throttle caps concurrent runs of the same category across all builds.
+
+    Essential for: prod deploys, DB migrations, shared test environments.
+
+4.8 Pipeline durability vs. speed
+durabilityHint	Speed	Behavior on crash
+MAX_SURVIVABILITY (default)	slowest	resumes from last step
+PERFORMANCE_OPTIMIZED	~2–3× faster	may not resume; may need restart
+PERFORMANCE_OPTIMIZED_2	fastest	least durable
+
+Rule: default (MAX_SURVIVABILITY) for deploy/migration jobs; PERFORMANCE_OPTIMIZED for build/test stages where re-run is cheap.
+4.9 Deterministic builds
+
+    Pinned base images (digest).
+
+    Pinned tool versions (tool 'jdk17', maven '3.9.6', nodejs '20.11.0').
+
+    Pinned dependency lockfiles (package-lock.json, requirements.txt with hashes, go.sum).
+
+    SOURCE_DATE_EPOCH for reproducible timestamps.
+
+    Archive the SBOM alongside the artifact.
+
+Part 5 — Security
+5.1 Never expose Jenkins directly
+
+    Controller listens on 127.0.0.1:8080.
+
+    Reverse proxy terminates TLS on :443.
+
+    No public ingress to :8080 or :50000.
+
+bash
+
+--httpListenAddress=127.0.0.1 --httpPort=8080
+
+5.2 Security realm — never local accounts in production
+
+    LDAP / Active Directory / OIDC / SAML.
+
+    Local Jenkins accounts only for break-glass (documented, rotated, removed after use).
+
+    MFA at the IdP — Jenkins inherits it.
+
+5.3 Authorization — least privilege
+
+    role-strategy with global + folder roles.
+
+    Agents → Controller Access Control must be enabled (/manage/configureSecurity/).
+
+        Without this, a compromised agent can read $JENKINS_HOME/secret.key and decrypt all credentials.
+
+    Review role assignments monthly.
+
+    Overall/Administer only to a small named group.
+
+Verify:
+bash
+
+curl -sS -u admin:$TOKEN http://localhost:8080/role-strategy/strategy/getAllRoles | jq
+
+5.4 CSRF protection stays on
+
+    Enabled by default; do not disable.
+
+    All non-GET API calls need the crumb:
+
+bash
+
+CRUMB=$(curl -sS -u admin:$TOKEN http://localhost:8080/crumbIssuer/api/json | jq -r .crumb)
+curl -u admin:$TOKEN -H "Jenkins-Crumb: $CRUMB" -X POST http://localhost:8080/quietDown
+
+5.5 Script Security — sandbox by default, approvals on purpose
+
+    script-security must stay enabled.
+
+    Prefer sandboxed pipelines; use @NonCPS sparingly.
+
+    Every approval of a Groovy signature is a permanent sandbox bypass — review before approving, prune scriptApproval.xml monthly.
+
+    Audit scriptApproval.xml for accidental method java.lang.Runtime execute-style approvals.
+
+Verify:
+bash
+
+grep -E 'Runtime|ProcessBuilder|exec' /var/lib/jenkins/scriptApproval.xml || echo "no exec approvals"
+
+5.6 Disable unused surfaces
+Surface	How	Why
+CLI over remoting	jenkins.CLI.xml → <enabled>false</enabled>	RCE-adjacent; unused in modern CI
+JNLP :50000	Use WebSocket launcher; close port	Attack surface
+SSH server	Disable if not used	—
+/script, /scriptText	Restrict to Overall/Administer; audit	RCE by design
+/computer/(built-in)/script	Same	RCE on controller
+Anonymous read access	Disable	Info disclosure
+Update center	Pin to local mirror or disable	Supply-chain
+5.7 Markup formatter — antisamy-markup-formatter
+
+Safe HTML in descriptions. Without it, stored XSS in job descriptions is possible.
+5.8 TLS everywhere
+
+    Reverse proxy terminates TLS with a CA-signed cert.
+
+    Controller on loopback.
+
+    Trust corporate CA in $JAVA_HOME/lib/security/cacerts for outbound TLS (LDAP, SCM, registries) — bake it into the base image.
+
+    Rotate certs before expiry (alert at 30 days).
+
+5.9 Audit trail
+
+    audit-trail plugin → syslog → SIEM.
+
+    Alert on: scriptApproval additions, credential reads, permission changes, scriptText invocations, reload, restart.
+
+5.10 Security patch cadence
+
+    Subscribe to https://www.jenkins.io/security/advisories/.
+
+    Critical (RCE, auth bypass) — patch within 24–72h in a window.
+
+    High — within 7 days.
+
+    Track plugin CVEs (Dependabot/Renovate on plugins.txt).
+
+Part 6 — Credentials & Secrets
+6.1 External secret managers over credentials.xml
+
+Prefer:
+
+    HashiCorp Vault (hashicorp-vault-plugin) — AppRole / K8s auth, dynamic secrets.
+
+    Kubernetes Credentials Provider — pull from K8s Secret.
+
+    AWS Secrets Manager / Azure Key Vault via plugins or withCredentials bridging.
+
+credentials.xml only for:
+
+    SSH deploy keys, registry push credentials that a plugin needs at config time.
+
+    Credentials that must be visible in the "Credentials" dropdown.
+
+6.2 Scope credentials to folder domains
+
+Credentials scoped to folder('team-a') are invisible outside it. Use role-strategy folder roles + credential domains together.
+6.3 Never log, echo, or store secrets
+
+    withCredentials scopes the value to the block.
+
+    sh receives it as env, not on the command line (sh '... "$TOKEN"').
+
+    Ban set -x around credential blocks in shell steps.
+
+    Ban echo "$SECRET".
+
+    Ban writing secrets to $WORKSPACE.
+
+6.4 Rotate on a schedule
+Secret	Cadence
+API tokens (humans)	90 days
+API tokens (automation)	90 days, or per-policy
+Git deploy keys	90 days
+Registry push creds	90 days
+Sonar / Nexus tokens	90 days
+LDAP bind password	180 days or IdP policy
+TLS certs	before expiry, alert at 30 days
+secret.key	only on suspected compromise (see §10.4)
+6.5 Break-glass admin — documented, offline, rotated
+
+    One local admin account, password in vault, offline.
+
+    Used only when IdP/LDAP is unreachable.
+
+    Logged in SIEM; alert on use.
+
+    Removed/rotated immediately after recovery.
+
+Part 7 — Configuration as Code
+7.1 JCasC is the source of truth
+
+jenkins.yaml + plugins.txt + init.groovy.d/ in git. Everything else is derived.
+yaml
+
+# What MUST be in JCasC
+jenkins:
+  systemMessage: "..."
+  numExecutors: 0
+  mode: NORMAL
+  securityRealm: {...}
+  authorizationStrategy: {...}
+  clouds: [...]
+  nodes: [...]
+credentials:
+  system: {...}
+unclassified:
+  location: {...}
+  globalLibraries: {...}
+  timestamper: {...}
+  slackNotifier: {...}
+tool:
+  git: {...}
+  jdk: {...}
+
+7.2 JCasC is validated before it's applied
+bash
+
+# validate-only (no reload)
+curl -u admin:$TOKEN https://jenkins.example.com/configuration-as-code/schema
+# reload
+curl -u admin:$TOKEN -X POST https://jenkins.example.com/configuration-as-code/reload
+
+Rule: validate in staging → apply in prod. Never reload a jenkins.yaml you haven't validated.
+7.3 Secrets interpolation is environment-only
+yaml
+
+managerPasswordSecret: "${LDAP_BIND_PW}"
+
+${VAR} resolves from the Jenkins process environment. Supply via:
+
+    systemd EnvironmentFile=/etc/jenkins-ops/env (chmod 600).
+
+    Kubernetes Secret mounted as env.
+
+    Vault agent injecting env (preferred for rotation).
+
+7.4 init.groovy.d/ is code, not scripts
+
+    Version-controlled in git.
+
+    Reviewed like application code.
+
+    Runs as SYSTEM at boot — a malicious script is total compromise.
+
+    Kept minimal — JCasC covers 90% of what used to require init.groovy.d/.
+
+7.5 Drift detection
+
+    Nightly: compare live config.xml / jobs/*/config.xml against a rendered-from-JCasC expected state.
+
+    Alert on drift > N items.
+
+    In practice: weekly_inventory.py + a diff tool is enough.
+
+Part 8 — Plugin Management
+8.1 Pin every plugin version
+
+plugins.txt in git:
+text
+
+workflow-aggregator:600.vb_57cdd26fdd7
+kubernetes:4287.v98a_8f9b_2a_1d
+git:5.7.0
+
+Never --latest true in production. A plugin release on a Tuesday can break your Wednesday.
+8.2 Resolve dependencies with the official tool
+bash
+
+java -jar jenkins-plugin-manager.jar \
+  --war jenkins.war \
+  --plugin-file plugins.txt \
+  --plugin-download-directory ./plugins \
+  --latest false --clean-target-dir
+
+Never copy .hpi files by hand without resolving the dependency graph.
+8.3 Uninstall unused plugins
+
+    Disabled ≠ removed. A disabled plugin still consumes classpath and can be re-enabled by a compromised account.
+
+    Quarterly audit: pluginManager/api/json → uninstall anything not referenced by plugins.txt.
+
+8.4 Upgrade in small batches
+
+    1–3 plugins per window. Verify, repeat.
+
+    Never "Update all" on a live controller.
+
+    Backup → quiet down → update → readiness → unquiet.
+
+    Read the changelog; breaking changes land in minor versions (kubernetes pod schema, role-strategy permission model, script-security sandbox).
+
+8.5 Track CVE exposure
+
+    Subscribe to advisories.
+
+    Generate a nightly CVE report from pluginManager/api/json × advisory feed.
+
+    Alert on a plugin version with a known CVE.
+
+8.6 Mirror the update center for air-gapped fleets
+
+    hudson.model.UpdateCenter.xml → internal signed mirror.
+
+    Never trust an update-center over plain HTTP from an untrusted network — that JSON redirects plugin downloads → RCE.
+
+Part 9 — Reliability & HA
+9.1 Define SLIs / SLOs before you build HA
+SLI	SLO
+/login 200 rate	99.9% / 30d
+API latency p95	< 500ms
+Build queue depth	< 20 for 95% of time
+Agent availability	≥ 99% per pool
+Backup success	100% nightly
+Restore test	100% quarterly
+
+If you don't have SLIs, "HA" is a hypothesis.
+9.2 HA is active-passive, not active-active
+
+    Blue/green controller pair behind the proxy.
+
+    Both point at the same backup source (or one is cold).
+
+    Cutover: drain active → restore latest backup on passive → flip proxy → reconfigure agents' jenkinsUrl (or use DNS).
+
+    Never two controllers writing to the same $JENKINS_HOME.
+
+9.3 Graceful restart is the default
+bash
+
+# 1. quiet
+curl -u admin:$TOKEN -X POST http://localhost:8080/quietDown
+# 2. wait for zero builds
+until [ "$(curl -sS -u admin:$TOKEN http://localhost:8080/computer/api/json | \
+  jq '[.computer[].executors[].currentExecutable] | map(select(.!=null)) | length')" = "0" ]; do
+  sleep 15
+done
+# 3. restart
+sudo systemctl restart jenkins
+# 4. wait for readiness (not just liveness)
+until curl -fsS -m 3 -u admin:$TOKEN 'http://localhost:8080/api/json?tree=mode' >/dev/null; do
+  sleep 5
+done
+# 5. unquiet
+curl -u admin:$TOKEN -X POST http://localhost:8080/cancelQuietDown
+
+safeRestart API waits for builds, but does not wait for queue; drain both.
+9.4 Startup budget as an SLO
+
+    Track "time to ready" as a metric.
+
+    Alert if > 2× baseline.
+
+    If startup > 5 min, find the phase: -Djenkins.model.Jenkins.logStartupPerformance=true.
+
+    Controllers should start in under 3 minutes; a 10-minute startup is a reliability incident in disguise.
+
+9.5 Graceful shutdown
+
+systemctl stop sends SIGTERM; Jenkins handles it. But:
+
+    TimeoutStopSec=120 — if it takes longer, systemd kills it (in-flight builds lost).
+
+    POST /quietDown before stop — drains.
+
+    For K8s, set terminationGracePeriodSeconds: 180 and a preStop hook that calls /quietDown.
+
+9.6 Never rely on Restart=always
+
+Restart=on-failure with StartLimitBurst=5 — you want the controller to stay down if it's in a crash loop, not flap 200 times an hour and bury the root cause.
+Part 10 — Backup & Disaster Recovery
+10.1 Back up together, restore together
+
+The tier-0 set — these five are meaningless apart:
+text
+
+config.xml
+credentials.xml
+secret.key
+identity.key.enc
+secrets/
+
+Plus:
+text
+
+jobs/
+users/
+nodes/
+plugins/          (or plugins.txt + manifest)
+hudson.model.UpdateCenter.xml
+jenkins.yaml
+init.groovy.d/
+scriptApproval.xml
+
+A restore that misses secret.key cannot decrypt credentials.xml. Restore that misses identity.key.enc breaks agent identity and some plugin state.
+10.2 Back up hot, but consistently
+bash
+
+#!/usr/bin/env bash
+set -euo pipefail
+TS=$(date +%F_%H%M)
+DST=/var/backups/jenkins
+JH=/var/lib/jenkins
+mkdir -p "$DST"
+
+# Preferred: quiet down + wait for zero builds, then backup, then unquiet.
+# If you cannot quiet (24/7), accept that in-flight jobs are not consistent
+# and that `queue.xml` is a moving target — but credential/config files
+# are written atomically and are safe to copy.
+
+tar czf "$DST/jenkins-$TS.tgz" \
+  -C "$JH" --exclude='workspace' --exclude='war' \
+  config.xml credentials.xml secret.key secret.key.not-so-secret \
+  identity.key.enc secrets/ jobs/ users/ nodes/ plugins/ \
+  hudson.model.UpdateCenter.xml init.groovy.d/ scriptApproval.xml \
+  jenkins.yaml
+
+sha256sum "$DST/jenkins-$TS.tgz" > "$DST/jenkins-$TS.sha256"
+find "$DST" -name 'jenkins-*.tgz' -mtime +30 -delete
+
+10.3 Test restores quarterly
+
+A backup you have not restored is not a backup. Restore into a throwaway controller with the same WAR and plugins.txt:
+bash
+
+JENKINS_HOME=/tmp/restore/jenkins java -jar jenkins.war --httpPort=18080 &
+# verify: /login 200, credentials decrypt, a job builds, an agent connects
+
+10.4 secret.key rotation — only under procedure
+
+Rotating secret.key invalidates all encrypted credentials. Only do this if the key is suspected compromised:
+
+    Stop Jenkins.
+
+    Backup $JENKINS_HOME.
+
+    Move secret.key and identity.key.enc aside.
+
+    Start Jenkins — new key generated; credentials.xml ciphertext unreadable.
+
+    Re-enter every credential (UI, JCasC, or Vault).
+
+    Verify all jobs.
+
+    Destroy old backups that contain the leaked key.
+
+Better: migrate to Vault so credentials.xml is empty and rotation is a non-event.
+Part 11 — Monitoring & Observability
+11.1 Liveness vs. readiness vs. deep health
+Check	Endpoint	Meaning
+Liveness	GET /login → 200	JVM + app responding
+Readiness	GET /api/json?tree=mode → 200	init complete
+Deep health	/prometheus, /monitoring	heap, executors, queue, GC
+Dependency	ldapsearch, SCM ping	external deps reachable
+
+K8s probes: use startupProbe (up to 5 min) + livenessProbe + readinessProbe — never livenessProbe alone, or you get a restart loop during init.
+11.2 Scrape /prometheus
+
+Metrics you must alert on:
+Metric	Threshold
+jenkins_vm_memory_heap_used_bytes / …_max	> 0.9 for 10m
+rate(jenkins_vm_gc_time_seconds_total[5m])	> 0.5 for 10m
+jenkins_queue_size_value	> 20 for 15m
+jenkins_node_offline_value	> 0 for 5m
+jenkins_executor_in_use_value / count	> 0.95 for 15m
+jenkins_file_descriptor_ratio	> 0.85
+jenkins_uptime_seconds reset	restart loop
+11.3 Blackbox /login
+
+A synthetic probe every 30s from outside the controller's host — catches proxy, DNS, and TLS failures that an internal scrape misses.
+11.4 Log-based alerts
+
+Ship /var/log/jenkins/jenkins.log to Loki/ELK. Alert on:
+Pattern	Severity
+OutOfMemoryError	critical
+HudsonFailedToLoad	critical
+UnsatisfiedDependencyException / requires Jenkins	warning
+InvalidCipherTextException / Could not decrypt	critical
+AccessDeniedException	warning
+Address already in use	warning
+Burst of Restarting / shutting down	critical
+scriptApproval additions	security
+11.5 Inventory drift alerting
+
+Nightly: pluginManager/api/json vs plugins.txt → alert on any difference. This catches both drift (someone clicked "Update") and supply-chain compromise.
+11.6 Alert on restarts, not just "up"
+
+A controller that restarted 8 times in an hour is not "up". Alert on changes(jenkins_uptime_seconds[15m]) > 2.
+Part 12 — Upgrade Strategy
+12.1 Upgrade cadence
+Frequency	What
+Weekly	Review security advisories; patch critical CVEs in window
+Monthly	LTS patch (.1 → .2), 1–3 plugins
+Quarterly	Plugin audit, DR test, cert rotation
+Annual	Java major version, platform major versions
+12.2 Pre-flight checklist
+bash
+
+# 1. Read changelog
+# https://www.jenkins.io/changelog-stable/
+
+# 2. Resolve plugin set against new WAR (do this on staging)
+java -jar jenkins-plugin-manager.jar --war jenkins-new.war \
+  --plugin-file plugins.txt --list
+
+# 3. Confirm Java version
+java -version  # LTS >= 2.479 requires 17 or 21
+
+# 4. Backup + verify
+sudo tar czf /var/backups/jenkins-pre-upgrade-$(date +%F).tgz -C /var/lib jenkins/
+tar tzf /var/backups/jenkins-pre-upgrade-*.tgz >/dev/null && echo backup-ok
+
+12.3 Upgrade window
+text
+
+quiet down → wait for zero builds → backup → stop → swap WAR + plugins
+→ start → wait for readiness → verify → cancel quiet down
+
+Never upgrade without a tested rollback (see previous guide §14.3).
+12.4 Rollback is all-or-nothing
+
+Restoring plugins/ without the matching WAR, or credentials.xml without secret.key, corrupts the instance. Restore the full $JENKINS_HOME + matching WAR from the same backup.
+Part 13 — Change Management
+13.1 One change per window
+
+    One plugin, one core line, one config change.
+
+    Bisectable rollback.
+
+    "Update all" is not a change — it's a bet.
+
+13.2 Change log
+
+Every production change → ticket + PR + changelog entry:
+text
+
+date | change | scope | tested-in-staging | rollback | approver
+
+This is not bureaucracy — it's the only way to bisect a regression three weeks later.
+13.3 Staging controller is mandatory
+
+    Same WAR, same plugins.txt, same jenkins.yaml.
+
+    Copy of prod $JENKINS_HOME with secrets scrubbed (or restored from a vault-loaded version).
+
+    Same agent images, same K8s namespace shape.
+
+    Every upgrade tested here first.
+
+13.4 Peer review on Jenkinsfiles and JCasC
+
+    Pipeline code is code.
+
+    JCasC is code.
+
+    init.groovy.d/ is code.
+
+    All require review by someone other than the author.
+
+Part 14 — Team & Workflow Practices
+14.1 One owner per controller
+
+    Named owner (team or individual) for $JENKINS_HOME.
+
+    Owner reviews upgrades, holds credentials, runs DR tests.
+
+    "Everyone's Jenkins" is nobody's Jenkins.
+
+14.2 Documentation lives next to the config
+
+    README.md in the ops repo: architecture, runbook, break-glass, escalation.
+
+    Links to dashboards, alerts, on-call.
+
+    Updated with every change.
+
+14.3 On-call training
+
+    New on-call runs the restore test in staging before their first shift.
+
+    New on-call has the break-glass procedure open in front of them.
+
+    Post-incident review for every Jenkins-down event — not blame, but root cause and prevention.
+
+14.4 Deprecate, don't delete, jobs
+
+    Move unused jobs to a _deprecated/ folder, then archive.
+
+    Deleting a job destroys its build history — sometimes that's the audit trail.
+
+    Archive artifacts to an artifact repository before deleting the job.
+
+14.5 Post-mortems for pipeline regressions
+
+A broken pipeline that ships a bad artifact is a production incident, not a "CI issue". Same process as a production outage.
+Part 15 — Common Anti-Patterns (and What to Do Instead)
+Anti-pattern	Consequence	Fix
+Controller has executors	OOM, UI hangs, security risk	numExecutors: 0
+$JENKINS_HOME on NFS	Corruption, stale locks, lost jobs	local SSD
+plugins.txt with latest	Non-reproducible; breakage on restart	pin versions
+"Update all" in prod	Partial upgrade + restart + failed plugins	1–3 per window
+credentials.xml hand-edited	Corrupt or lost secret; Jenkins can't decrypt	UI/JCasC/Vault
+secret.key backed up alone	Restore impossible	back up with credentials.xml together
+Disabled-but-installed plugins	Classpath bloat + re-enable risk	uninstall
+env for secrets	Leaks in logs, env dumps, child processes	withCredentials
+echo "$SECRET" in shell	Plaintext in build log	never
+@Library('...@master')	Supply-chain; unreviewed changes	pin semver tag
+Long-lived prod-deploy agent	State drift, lateral movement	ephemeral + role-strategy + lock
+livenessProbe without startupProbe	Restart loop during init	startupProbe with 5 min budget
+No buildDiscarder	Disk fills in weeks	every pipeline
+No cleanWs()	Workspace accumulates	post { always { cleanWs() } }
+Restart=always	Flaps on config errors	Restart=on-failure + StartLimitBurst
+Anonymous read	Info disclosure	disable
+Update center over plain HTTP	RCE via redirect	TLS + signed mirror
+No staging controller	Every upgrade is a production experiment	mandatory staging
+Break-glass in init.groovy.d/ committed	Total compromise in git	vault + remove after use
+Never testing restores	"Backup" that can't restore	quarterly restore test
+Part 16 — The 20 Rules, One-Line Each
+
+    numExecutors: 0 on the controller — always.
+
+    Pin WAR, plugins, JDK, agent images.
+
+    JCasC + plugins.txt + Jenkinsfile in git — code all the way down.
+
+    secret.key + identity.key.enc + credentials.xml — back up together, never edit.
+
+    Never hand-edit $JENKINS_HOME while running.
+
+    Local POSIX storage for $JENKINS_HOME — never NFS.
+
+    Discard builds and clean workspaces in every pipeline.
+
+    withCredentials, never env, for secrets.
+
+    Vault / K8s Secrets over credentials.xml where possible.
+
+    role-strategy + folder tenancy; Overall/Administer to a small named group.
+
+    Agent → Controller Access Control enabled, always.
+
+    script-security ON, CLI OFF, JNLP scoped.
+
+    TLS at the proxy; controller on loopback.
+
+    Staging controller — every upgrade tested there first.
+
+    1–3 plugins per window — never "Update all" in prod.
+
+    Quiet down → backup → swap → readiness → unquiet — the only restart pattern.
+
+    /prometheus + /login blackbox + log signatures — alert on all three.
+
+    Nightly backup, quarterly restore test, monthly drift check.
+
+    Inventory drift alert — installed plugins vs plugins.txt.
+
+    Break-glass documented, vault-stored, rotated, audited.
+
+Part 17 — Quick Audit Script
+
+Paste into a shell on the controller host; each line prints OK/FAIL.
+bash
+
+#!/usr/bin/env bash
+set -u
+J=${JENKINS_HOME:-/var/lib/jenkins}
+U=${JENKINS_URL:-http://127.0.0.1:8080}
+A="-u ${JENKINS_USER}:${JENKINS_TOKEN}"
+ok=0; fail=0
+check(){ if eval "$2" >/dev/null 2>&1; then echo "OK   $1"; ok=$((ok+1)); else echo "FAIL $1"; fail=$((fail+1)); fi; }
+
+check "controller has 0 executors" \
+  "[ \"\$(curl -sS $A $U/api/json?tree=numExecutors | jq -r .numExecutors)\" = 0 ]"
+check "no NFS on \$JENKINS_HOME" \
+  "! mount | awk '\$3==\"$J\"' | grep -qE 'nfs|cifs'"
+check "config.xml readable only by jenkins" \
+  "[ \"\$(stat -c %a $J/config.xml)\" -le 640 ]"
+check "secret.key perms 600" \
+  "[ \"\$(stat -c %a $J/secret.key)\" = 600 ]"
+check "credentials.xml perms 600" \
+  "[ \"\$(stat -c %a $J/credentials.xml)\" = 600 ]"
+check "CLI disabled" \
+  "grep -q '<enabled>false</enabled>' $J/jenkins.CLI.xml"
+check "CSRF enabled" \
+  "[ \"\$(curl -sS $A $U/crumbIssuer/api/json | jq -r .crumbRequestField)\" = 'Jenkins-Crumb' ]"
+check "no exec approvals in script-security" \
+  "! grep -qE 'Runtime|ProcessBuilder' $J/scriptApproval.xml"
+check "build discarder on all jobs" \
+  "[ \"\$(find $J/jobs -name config.xml -exec grep -L 'logRotator\\|buildDiscarder' {} \\;)\" = '' ]"
+check "plugins.txt exists in ops repo" \
+  "[ -f /opt/jenkins-ops/plugins.txt ]"
+check "last backup < 48h" \
+  "[ \"\$(find /var/backups/jenkins -name 'jenkins-*.tgz' -mtime -2 | wc -l)\" -gt 0 ]"
+check "Jenkins URL matches public URL" \
+  "[ \"\$(grep -o '<jenkinsUrl>[^<]*' $J/jenkins.model.JenkinsLocationConfiguration.xml | sed 's#<jenkinsUrl>##')\" = '${PUBLIC_URL:-https://jenkins.example.com/}' ]"
+
+echo "── OK=$ok FAIL=$fail ──"
+[ $fail -eq 0 ]
+
+This is the production practice set: topology, controller hygiene, agent discipline, pipeline design, security, secrets, JCasC, plugins, HA, backup, monitoring, upgrades, change management, team workflow, anti-patterns, and a runnable audit. Adopt the rules incrementally — every one of them exists because something broke in someone's production

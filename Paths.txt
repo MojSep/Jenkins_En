@@ -1,0 +1,358 @@
+﻿Jenkins on Linux — Config Files, Paths, Secure Changes, and URL Structure
+1. $JENKINS_HOME — Core Configuration Directory
+
+Typical defaults:
+
+    Debian/Ubuntu (jenkins package): /var/lib/jenkins
+
+    RHEL/CentOS (jenkins RPM): /var/lib/jenkins
+
+    Docker/jenkins/jenkins image: /var/jenkins_home
+
+    Manual WAR: whatever you set in JENKINS_HOME
+
+bash
+
+echo $JENKINS_HOME
+systemctl show jenkins | grep Environment
+
+Directory tree
+text
+
+$JENKINS_HOME/
+├── config.xml                                  # Global system config (root <hudson>)
+├── credentials.xml                             # Encrypted credentials store (AES)
+├── secret.key                                  # Master key for Secret encryption
+├── secret.key.not-so-secret                    # Marker / HMAC salt
+├── identity.key.enc                            # Instance identity (encrypted)
+├── hudson.model.UpdateCenter.xml               # Update site URLs
+├── hudson.security.csrf.GlobalCrumbIssuerConfiguration.xml
+├── hudson.security.SecurityRealm.xml            # (older naming variants)
+├── jenkins.model.JenkinsLocationConfiguration.xml  # Jenkins URL + admin email
+├── jenkins.CLI.xml                             # CLI over remoting toggle
+├── jenkins.telemetry.Correlator.xml
+├── jenkins.plugins.publish_over_ssh.BapSshPublisherPlugin.xml  # plugin-specific
+├── nodeMonitors.xml
+├── queue.xml                                   # Build queue state
+├── copy_reference_file.log
+├── jobs/
+│   └── <JOB_NAME>/
+│       ├── config.xml                          # Job definition
+│       ├── builds/
+│       │   ├── <N>/build.xml
+│       │   └── <N>/log
+│       ├── nextBuildNumber
+│       ├── workspace/
+│       └── promotions/                         # if promoted-builds plugin
+├── nodes/
+│   └── <NODE_NAME>/
+│       └── config.xml
+├── users/
+│   └── <USERNAME>/
+│       ├── config.xml                          # User properties (not credentials)
+│       └── ...
+├── secrets/
+│   ├── hudson.util.Secret                      # Encrypted master secret
+│   ├── master.key
+│   ├── initialAdminPassword
+│   └── file-name-secrets/                      # Per-file secret handles
+├── plugins/
+│   ├── <PLUGIN>.jpi                            # Installed plugin binary
+│   └── <PLUGIN>/                               # Extracted plugin
+│       └── META-INF/
+├── updates/
+│   └── default.json                            # Update center cache
+├── init.groovy.d/                              # Groovy scripts run at boot (alphabetical)
+│   └── *.groovy
+├── fingerprints/
+├── logs/
+│   ├── tasks/
+│   └── ... 
+├── war/                                        # Exploded WAR (if not --daemon)
+└── workspace/
+
+File-by-file: purpose + sensitivity
+File	Purpose	Sensitivity	Reload behavior
+config.xml	Global Jenkins config (system message, executors, SCM, security realm reference, clouds, tools)	High — contains LDAP bind DNs, SMTP, cloud creds refs, agent secrets refs	Manual edit requires Reload Configuration from Disk or restart
+credentials.xml	Encrypted credential bindings (username/password, SSH keys, certs, tokens)	CRITICAL — decryptable with secret.key	Read at startup; use Credentials UI / JCasC instead of editing
+secret.key	AES master key for hudson.util.Secret	CRITICAL — if leaked, all credentials.xml ciphertext can be decrypted	Do not rotate casually; breaks all stored secrets
+identity.key.enc	Instance RSA private key	CRITICAL	Same — rotation requires careful migration
+secrets/master.key	Legacy / component keying	CRITICAL	—
+jenkins.model.JenkinsLocationConfiguration.xml	jenkinsUrl, adminAddress	Medium	Hot-reloadable via script console
+hudson.model.UpdateCenter.xml	Update site URLs	Medium — malicious URL = RCE via plugin	Restart or UI
+init.groovy.d/*.groovy	Bootstrap Groovy (alphabetical)	High — arbitrary code at startup	Only at startup
+jobs/<J>/config.xml	Job definition (pipeline, SCM URL, triggers)	Medium/High	Auto-detected; can reload per-job
+nodes/<N>/config.xml	Agent config (labels, launcher, remote FS)	Medium	Restart or UI
+users/<U>/config.xml	User profile, API keys, SSH keys	Medium	—
+queue.xml	Persistent build queue	Low	Internal — do not edit
+nodeMonitors.xml	Disk/swap/clock monitor thresholds	Low	Restart
+Other system paths outside $JENKINS_HOME
+Path	Purpose
+/etc/default/jenkins (Debian)	Service defaults: JENKINS_HOME, JENKINS_PORT, JENKINS_ARGS, JAVA_ARGS, HTTP_PORT
+/etc/sysconfig/jenkins (RHEL/CentOS)	Same, legacy
+/usr/lib/systemd/system/jenkins.service	systemd unit: User=jenkins, EnvironmentFile=, ExecStart=
+/etc/init.d/jenkins	SysV init (older)
+/var/log/jenkins/jenkins.log	Main log (default from init scripts)
+/var/cache/jenkins/war/	Exploded WAR (Debian/RPM default)
+/var/lib/jenkins/plugins/*.jpi	Plugin binaries
+/var/lib/jenkins/updates/default.json	Update center metadata
+/etc/nginx/conf.d/jenkins.conf / /etc/httpd/conf.d/jenkins.conf	Reverse proxy config
+/etc/ssl/certs/, /etc/pki/tls/	TLS material for --httpsKeyStore
+2. Secure Modification Practices
+2.1 Golden rules
+
+    Back up first
+    bash
+
+    tar czf jenkins-backup-$(date +%F).tgz -C /var/lib jenkins/
+
+    Stop or reload appropriately
+
+        Never edit config.xml, credentials.xml, or jobs/*/config.xml while Jenkins may rewrite them — use the UI, JCasC, or reload-configuration.
+
+        credentials.xml and secret.key must never be hand-edited; use the Credentials plugin or JCasC.
+
+    Correct ownership/permissions
+    bash
+
+    chown -R jenkins:jenkins /var/lib/jenkins
+    chmod 750 /var/lib/jenkins
+    chmod 700 /var/lib/jenkins/secrets
+    chmod 600 /var/lib/jenkins/secret.key /var/lib/jenkins/identity.key.enc
+    chmod 600 /var/lib/jenkins/credentials.xml
+    chmod 600 /var/lib/jenkins/secrets/*
+    find /var/lib/jenkins -type f -name '*.xml' -exec chmod 640 {} \;
+
+    Use umask 027 (or 077 for secrets/) via systemd UMask= in the unit file.
+
+    Never store plaintext secrets — use withCredentials, credentials() pipeline helper, or the Secret type. Avoid echoing them.
+
+    Prefer declarative tooling
+
+        JCasC (Configuration as Code) plugin: $JENKINS_HOME/jenkins.yaml or /etc/jenkins/jenkins.yaml, hot-reload via POST /reload or manage/config → "Reload existing configuration". Secrets should reference environment variables (${SECRET}) or external secret managers.
+
+        jenkins-cli:
+        bash
+
+        java -jar jenkins-cli.jar -s https://jenkins.example.com -auth user:token \
+          reload-configuration
+
+        REST API for job CRUD:
+        bash
+
+        curl -u user:apiToken -X POST \
+          https://jenkins.example.com/job/NAME/config.xml \
+          -H 'Content-Type: application/xml' --data-binary @config.xml
+
+        init.groovy.d/*.groovy — deterministic at boot; keep in version control and review each script (it runs as SYSTEM).
+
+    Secure the Groovy console — /script is RCE-by-design; restrict Overall/Administer and audit /script access.
+
+    Reload vs restart
+
+        POST /reload — reloads config.xml, jobs/*/config.xml, nodes/*/config.xml from disk; does not reload secret.key or credentials.xml.
+
+        systemctl restart jenkins — full reload of keys and credentials.
+
+    Audit trail
+
+        Enable jenkins.security.SecurityListener / audit-log plugin.
+
+        Ship jenkins.log and $JENKINS_HOME/jobs/*/builds/*/log to a SIEM.
+
+    API tokens & CSRF
+
+        Per-user API tokens (/user/<u>/configure), rotate regularly.
+
+        Keep CSRF protection (/manage/configureSecurity/) enabled; use --crumb or -crumb with the CLI.
+
+    TLS
+
+        Terminate at the reverse proxy; pass X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port; set jenkinsUrl in JenkinsLocationConfiguration.xml to the external HTTPS URL.
+
+    Secret rotation
+
+        secret.key rotation invalidates all existing credentials and hudson.util.Secret — perform via manage/credentials + re-entry, or migrate via a scripted export/import, during a maintenance window.
+
+2.2 What is safe to edit by hand vs. not
+Edit by hand (with Jenkins stopped)	Edit via UI / API / JCasC only	Never edit
+config.xml (with Reload afterwards)	credentials.xml	secret.key
+JenkinsLocationConfiguration.xml	users/*/config.xml (use /user/…)	identity.key.enc
+jobs/*/config.xml (then Reload)	plugin-specific *.xml	hudson.util.Secret
+init.groovy.d/*.groovy	security realm config	queue.xml
+jenkins.yaml (JCasC)	secrets/*	secrets/initialAdminPassword after first boot
+2.3 Hardening checklist (filesystem level)
+bash
+
+# Prevent world-readable configs
+chmod 750 /var/lib/jenkins
+chmod 700 /var/lib/jenkins/secrets
+chmod 600 /var/lib/jenkins/secret.key
+chmod 600 /var/lib/jenkins/identity.key.enc
+chmod 600 /var/lib/jenkins/credentials.xml
+chmod 640 /var/lib/jenkins/config.xml
+
+# service hardening
+systemctl edit jenkins
+# [Service]
+# UMask=0027
+# PrivateTmp=yes
+# ProtectSystem=full
+# NoNewPrivileges=yes
+
+3. URL Structure — Important Endpoints
+
+Base: https://jenkins.example.com/ (context path configurable via --prefix=/jenkins). All endpoints support ?tree=… on /api/json.
+text
+
+/
+├── /                                     Dashboard (view "all")
+├── /login                                Form login
+├── /logout
+├── /whoAmI/                              Current identity
+├── /me/                                  Redirect to /user/<self>
+├── /api/json                             REST: root object
+├── /api/xml
+├── /crumbIssuer/api/json                 CSRF crumb
+│
+├── /manage/                              "Manage Jenkins"
+│   ├── /configure                        Global config (system)
+│   ├── /configureSecurity/               Security realm, authz, CSRF
+│   ├── /configureTools/                  JDK, Maven, Gradle, Git
+│   ├── /configureClouds/                 Kubernetes/Docker/EC2 clouds
+│   ├── /configureNodes/                  → /computer/
+│   ├── /pluginManager/                   (or /manage/pluginManager/)
+│   │   ├── /available/                   Update center: available
+│   │   ├── /installed/                   Installed
+│   │   ├── /updates/                     Upgradable
+│   │   └── /advanced/                    Update site override
+│   ├── /about/                           Version, licenses
+│   ├── /systemInfo                       JVM, OS, env (admin)
+│   ├── /load-statistics
+│   ├── /threadDump                       (admin)
+│   ├── /cli                              CLI over HTTP
+│   ├── /script                           Groovy console (RCE — admin only)
+│   ├── /scriptText                       POST raw script → text/plain
+│   ├── /reload                           Reload config from disk
+│   ├── /safeRestart                      Safe restart
+│   ├── /restart                          Hard restart
+│   ├── /quietDown                        Prepare for shutdown
+│   ├── /cancelQuietDown
+│   └── /administrativeMonitor/
+│
+├── /computer/                            Nodes
+│   ├── /(built-in)/                      Controller node
+│   ├── /<NODE_NAME>/
+│   │   ├── /configure
+│   │   ├── /config.xml
+│   │   ├── /api/json
+│   │   ├── /log
+│   │   └── /script                       Agent script console
+│   └── /configure                        Add/configure nodes
+│
+├── /view/
+│   ├── /all/
+│   ├── /<VIEW_NAME>/
+│   └── /<VIEW_NAME>/api/json
+│
+├── /job/<JOB_NAME>/                      (folder jobs: /job/A/job/B/)
+│   ├── /                                 Job page
+│   ├── /config.xml                       GET/POST job XML
+│   ├── /api/json
+│   ├── /build                            POST trigger
+│   ├── /buildWithParameters              POST with params
+│   ├── /build?delay=0sec
+│   ├── /disable, /enable
+│   ├── /lastBuild/                       Latest build
+│   ├── /lastSuccessfulBuild/
+│   ├── /lastFailedBuild/
+│   ├── /<N>/                             Build N
+│   │   ├── /console                      Full log (HTML)
+│   │   ├── /consoleText                  Raw text log
+│   │   ├── /api/json
+│   │   ├── /stop                         Abort
+│   │   ├── /term                         (pipeline)
+│   │   ├── /pipeline-graph/
+│   │   └── /artifact/…
+│   ├── /ws/                              Workspace (admin)
+│   ├── /pipeline-syntax/                 Snippet generator (pipeline job)
+│   ├── /descriptorByName/<CLASS>/…
+│   ├── /polling                          SCM poll trigger (if enabled)
+│   └── /rename                           (POST)
+│
+├── /queue/
+│   ├── /api/json
+│   ├── /cancelItem?id=N                  (POST)
+│   └── /item/N/
+│
+├── /user/<USERNAME>/
+│   ├── /configure                        Profile, API token
+│   ├── /api/json
+│   └── /builds/
+│
+├── /people/                              All users
+├── /asynchPeople/                        AJAX people
+│
+├── /credentials/
+│   ├── /store/system/
+│   ├── /store/system/domain/_/
+│   └── /api/json
+│
+├── /securityRealm/                       Realm-specific (LDAP, SAML, etc.)
+├── /descriptorByName/                    Descriptor metadata (JSON)
+│
+├── /updateCenter/
+│   ├── /api/json
+│   └── /sites/default/
+│
+├── /cli                                  Remoting CLI endpoint (POST)
+├── /jnlpJars/                            agent.jar, jenkins-cli.jar, remoting.jar
+│   ├── /agent.jar
+│   ├── /jenkins-cli.jar
+│   └── /remoting.jar
+├── /agent-protocols/                     Protocol negotiation
+├── /tcpSlaveAgentListener/               Agent TCP port status
+├── /extensionList/                       Installed extensions
+├── /log/                                 Log viewer (admin)
+│   ├── /all
+│   ├── /rss
+│   └── /<log-name>
+├── /pipeline-syntax/                     Groovy pipeline snippet generator
+├── /safeRestart/
+├── /favicon.ico
+└── /robots.txt                           (if enabled)
+
+Notes on URL semantics
+
+    /reload vs /safeRestart vs /restart: reload re-reads XML config from disk (no JVM restart); safeRestart waits for builds to finish; restart is immediate.
+
+    /cli is the HTTP remoting channel. Disable via jenkins.CLI.xml (<enabled>false</enabled>) or -Dhudson.CLI.enabled=false if you don't use it, to reduce attack surface.
+
+    /script and /scriptText — gate behind Overall/Administer, and consider disabling in production via jenkins.model.Jenkins script approval or by removing admin from script-security allowlist.
+
+    /computer/(built-in)/script — per-agent Groovy console; equally sensitive.
+
+    /descriptorByName/<FQCN>/… — JSON schema of plugin descriptors; used by UI and JCasC.
+
+    /crumbIssuer/api/json returns { "crumbRequestField": "Jenkins-Crumb", "crumb": "…" } — required for POSTs when CSRF is on.
+
+    /api/json?tree=jobs[name,url,color] — efficient dashboarding queries.
+
+    Folder jobs nest: job/A/job/B/build.
+
+    Pipeline multibranch: /job/<MULTIBRANCH>/job/<BRANCH>/ (branch names URL-encoded as %2F).
+
+4. Quick Reference — Reload Matrix
+Change	Reload required	Command
+config.xml (global)	Yes	POST /reload or systemctl restart jenkins
+jobs/*/config.xml	No (auto), but reload forces	POST /reload
+nodes/*/config.xml	Yes	POST /reload
+credentials.xml	Restart	systemctl restart jenkins
+secret.key / identity.key.enc	Restart (and re-encrypt everything)	maintenance window
+init.groovy.d/*.groovy	Restart only	systemctl restart jenkins
+plugins/*.jpi	Restart	systemctl restart jenkins
+jenkins.yaml (JCasC)	POST /reload (JCasC listener)	via manage/config → "Reload existing configuration"
+JenkinsLocationConfiguration.xml	Hot	or POST /reload
+5. One-Paragraph Summary
+
+All persistent Jenkins state lives under $JENKINS_HOME (default /var/lib/jenkins). Treat secret.key, identity.key.enc, secrets/, credentials.xml as Tier-0 secrets — never hand-edit them, never make them world-readable (chmod 600, umask 027). Prefer JCasC (jenkins.yaml), the REST API (POST …/config.xml), jenkins-cli, or init.groovy.d over manual XML edits; always back up $JENKINS_HOME first, and use /reload for config-only changes and systemctl restart jenkins for key/credential/plugin changes. The operational surface is a well-known URL tree rooted at / with management under /manage/, per-job control under /job/<name>/, nodes under /computer/, queue under /queue/, and the sensitive RCE endpoints /script, /scriptText, /computer/(built-in)/script, /cli which must be locked to Overall/Administer and audited.

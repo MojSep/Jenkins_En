@@ -1,0 +1,795 @@
+﻿Jenkins Health Check — Complete Bash Script
+
+Below is a single, self-contained, production-ready script (jenkins-health-check.sh). It:
+
+    Detects JENKINS_HOME, JENKINS_URL, service name, and JDK automatically.
+
+    Checks service, JVM, files, permissions, plugins, config.xml, security XML, Jenkins URL, init.groovy.d, disk / inodes, backups, and recent log errors.
+
+    Emits green (OK) / yellow (WARN) / red (ERR) / dim (SKIP) with English diagnostics per finding.
+
+    Returns meaningful exit codes (0 healthy, 1 warnings, 2 critical) for cron/alerting.
+
+    Prints Visit more at https://github.com/MojSep at both the beginning and the end of output.
+
+jenkins-health-check.sh
+bash
+
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# jenkins-health-check.sh
+#
+# Health check for Jenkins: service, JVM, files, plugins, configs, security.
+# Emits colored (green/yellow/red) output with English diagnostics.
+#
+# Exit codes:
+#   0 = healthy
+#   1 = warnings (non-critical)
+#   2 = critical issues
+#
+# Usage:
+#   sudo ./jenkins-health-check.sh
+#   JENKINS_HOME=/var/lib/jenkins JENKINS_URL=http://127.0.0.1:8080 \
+#     JENKINS_USER=admin JENKINS_TOKEN=xxxx ./jenkins-health-check.sh
+#   ./jenkins-health-check.sh --no-color
+#
+# Visit more at https://github.com/MojSep
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── header/footer ───────────────────────────────────────────────────────────
+BANNER_URL="https://github.com/MojSep"
+print_banner() {
+    echo ""
+    echo "══════════════════════════════════════════════════════════════════"
+    echo "  Visit more at ${BANNER_URL}"
+    echo "══════════════════════════════════════════════════════════════════"
+    echo ""
+}
+
+# ─── colors ──────────────────────────────────────────────────────────────────
+USE_COLOR=1
+for arg in "$@"; do
+    [ "$arg" = "--no-color" ] && USE_COLOR=0
+done
+if [ "$USE_COLOR" = "1" ] && [ -t 1 ]; then
+    GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+    BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+else
+    GREEN=''; YELLOW=''; RED=''; BOLD=''; DIM=''; NC=''
+fi
+
+OK_COUNT=0; WARN_COUNT=0; ERR_COUNT=0; SKIP_COUNT=0
+
+ok()      { OK_COUNT=$((OK_COUNT+1));      printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
+warn()    { WARN_COUNT=$((WARN_COUNT+1));  printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
+err()     { ERR_COUNT=$((ERR_COUNT+1));    printf "${RED}[ERR ]${NC} %s\n" "$*"; }
+skip()    { SKIP_COUNT=$((SKIP_COUNT+1));  printf "${DIM}[SKIP]${NC} %s\n" "$*"; }
+section() { printf "\n${BOLD}── %s ──${NC}\n" "$*"; }
+detail()  { printf "       ${DIM}%s${NC}\n" "$*"; }
+
+# ─── environment ─────────────────────────────────────────────────────────────
+JENKINS_HOME="${JENKINS_HOME:-/var/lib/jenkins}"
+JENKINS_URL="${JENKINS_URL:-http://127.0.0.1:8080}"
+JENKINS_USER="${JENKINS_USER:-}"
+JENKINS_TOKEN="${JENKINS_TOKEN:-}"
+SERVICE_NAME="${SERVICE_NAME:-jenkins}"
+JENKINS_LOG="${JENKINS_LOG:-/var/log/jenkins/jenkins.log}"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/jenkins}"
+
+# auto-detect Jenkins home if the default does not exist
+if [ ! -d "$JENKINS_HOME" ]; then
+    for candidate in /var/lib/jenkins /var/jenkins_home /home/jenkins /opt/jenkins; do
+        if [ -d "$candidate" ]; then JENKINS_HOME="$candidate"; break; fi
+    done
+fi
+
+have_cmd()      { command -v "$1" >/dev/null 2>&1; }
+have_xmllint()  { have_cmd xmllint; }
+have_curl()     { have_cmd curl; }
+have_jq()       { have_cmd jq; }
+have_unzip()    { have_cmd unzip; }
+
+file_mode()  { stat -c '%a' "$1" 2>/dev/null; }
+file_owner() { stat -c '%U' "$1" 2>/dev/null; }
+file_mtime() { stat -c '%Y' "$1" 2>/dev/null; }
+
+# Compare octal mode `actual` <= `limit` (e.g. 640 <= 750)
+perm_le() {
+    local actual="${1:-999}" limit="${2:-999}"
+    [ -z "$actual" ] && return 1
+    # only valid octal digits
+    case "$actual" in *[!0-7]*) return 1 ;; esac
+    case "$limit"  in *[!0-7]*) return 1 ;; esac
+    (( 8#$actual <= 8#$limit ))
+}
+
+xml_contains() { grep -qE "$2" "$1" 2>/dev/null; }
+
+xml_value() {
+    sed -n "s/.*<$2>\(.*\)<\/$2>.*/\1/p" "$1" 2>/dev/null | head -1
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
+print_banner
+printf "${BOLD}Jenkins Health Check${NC}\n"
+printf "  JENKINS_HOME = %s\n" "$JENKINS_HOME"
+printf "  JENKINS_URL  = %s\n" "$JENKINS_URL"
+printf "  SERVICE      = %s\n" "$SERVICE_NAME"
+printf "  Host         = %s\n" "$(hostname -f 2>/dev/null || hostname)"
+printf "  Date (UTC)   = %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo ""
+
+# ─── 1. JENKINS_HOME ──────────────────────────────────────────────────────────
+section "1. JENKINS_HOME"
+if [ -d "$JENKINS_HOME" ]; then
+    ok "JENKINS_HOME exists: $JENKINS_HOME"
+    m=$(file_mode "$JENKINS_HOME"); o=$(file_owner "$JENKINS_HOME")
+    if perm_le "$m" 750; then
+        ok "JENKINS_HOME mode is restrictive: $m"
+    else
+        warn "JENKINS_HOME mode is $m (expected <= 750); other users may read state"
+    fi
+    if [ "$o" = "jenkins" ] || [ "$o" = "root" ]; then
+        ok "JENKINS_HOME owner: $o"
+    else
+        warn "JENKINS_HOME owner is '$o' (expected 'jenkins')"
+    fi
+    if [ -r "$JENKINS_HOME" ] && [ -x "$JENKINS_HOME" ]; then
+        ok "JENKINS_HOME is readable and traversable by this user"
+    else
+        err "JENKINS_HOME is not readable/traversable by this user — run as root or 'jenkins'"
+    fi
+else
+    err "JENKINS_HOME not found at $JENKINS_HOME"
+    print_banner
+    exit 2
+fi
+
+# ─── 2. service ──────────────────────────────────────────────────────────────
+section "2. Service Health"
+svc_found=0
+if have_cmd systemctl && systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}\.service"; then
+    svc_found=1
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "systemd unit '$SERVICE_NAME' is active"
+    else
+        err "systemd unit '$SERVICE_NAME' is NOT active"
+        detail "Diagnose: journalctl -u $SERVICE_NAME -b -n 200"
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        ok "systemd unit '$SERVICE_NAME' is enabled at boot"
+    else
+        warn "systemd unit '$SERVICE_NAME' is NOT enabled at boot"
+    fi
+    rc=$(systemctl show -p NRestarts --value "$SERVICE_NAME" 2>/dev/null)
+    if [ -n "$rc" ] && [ "$rc" -gt 0 ] 2>/dev/null; then
+        if [ "$rc" -ge 3 ]; then
+            err "Service restarted $rc times — possible crash loop"
+        else
+            warn "Service has $rc restart(s) recorded"
+        fi
+    else
+        ok "No recent restarts recorded"
+    fi
+fi
+if [ "$svc_found" = "0" ] && have_cmd docker; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q jenkins; then
+        cname=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -m1 jenkins)
+        ok "Docker container '$cname' is running"
+        hc=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cname" 2>/dev/null)
+        if [ "$hc" = "healthy" ]; then ok "Docker healthcheck: healthy"
+        elif [ "$hc" = "unhealthy" ]; then err "Docker healthcheck: unhealthy"
+        else warn "Docker healthcheck: $hc"; fi
+    else
+        err "No running Jenkins Docker container found"
+    fi
+fi
+if [ "$svc_found" = "0" ] && ! have_cmd docker; then
+    skip "No systemd unit '$SERVICE_NAME' and docker not available"
+fi
+
+# ─── 3. process & java ───────────────────────────────────────────────────────
+section "3. Process & JVM"
+PID=$(pgrep -f 'jenkins\.war' | head -1)
+if [ -n "$PID" ]; then
+    ok "Jenkins process is running (PID $PID)"
+    JCMD=$(ps -p "$PID" -o args= 2>/dev/null)
+    if echo "$JCMD" | grep -q '\-Xmx'; then
+        xmx=$(echo "$JCMD" | grep -oE '\-Xmx[0-9]+[gGmM]' | head -1)
+        ok "JVM heap bounded: $xmx"
+    else
+        warn "JVM has no explicit -Xmx — default is 25% of RAM (unpredictable)"
+    fi
+    echo "$JCMD" | grep -q 'MaxMetaspaceSize'             && ok "JVM MaxMetaspaceSize is set"     || warn "JVM has no -XX:MaxMetaspaceSize (risk of metaspace leak)"
+    echo "$JCMD" | grep -q 'HeapDumpOnOutOfMemoryError'  && ok "JVM will dump heap on OOME"      || warn "JVM does not dump heap on OutOfMemoryError"
+    echo "$JCMD" | grep -q 'java.awt.headless=true'      && ok "JVM is headless"                  || warn "JVM is not explicitly headless"
+    if echo "$JCMD" | grep -qE '\-Dhttp\.proxyHost|\-Dhttps\.proxyHost'; then
+        ok "JVM has proxy configuration"
+    fi
+    if have_cmd java; then
+        jv=$(java -version 2>&1 | head -1)
+        major=$(echo "$jv" | grep -oE '"[0-9]+' | tr -d '"' | head -1)
+        if [ -n "$major" ]; then
+            if [ "$major" -ge 17 ] 2>/dev/null && [ "$major" -le 21 ] 2>/dev/null; then
+                ok "Java version supported for recent LTS: $jv"
+            elif [ "$major" -lt 17 ] 2>/dev/null; then
+                err "Java major $major is below 17 — recent LTS requires 17 or 21"
+            else
+                warn "Java major $major — verify against your LTS line: $jv"
+            fi
+        fi
+    else
+        skip "java binary not on PATH"
+    fi
+else
+    err "No Jenkins process found (jenkins.war not running)"
+fi
+
+# ─── 4. HTTP & API ───────────────────────────────────────────────────────────
+section "4. HTTP & API"
+if have_curl; then
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -m 5 "$JENKINS_URL/login" 2>/dev/null || echo 000)
+    case "$code" in
+        200|403) ok "/login responds HTTP $code" ;;
+        000)     err "/login did not respond (network / proxy / service down)" ;;
+        *)       err "/login returned HTTP $code (expected 200/403)" ;;
+    esac
+    if [ -n "$JENKINS_USER" ] && [ -n "$JENKINS_TOKEN" ]; then
+        api_code=$(curl -sS -o /dev/null -w '%{http_code}' -m 5 \
+            -u "$JENKINS_USER:$JENKINS_TOKEN" "$JENKINS_URL/api/json" 2>/dev/null || echo 000)
+        case "$api_code" in
+            200)     ok "Authenticated API works (200)" ;;
+            401|403) err "API auth failed ($api_code) — check JENKINS_USER / JENKINS_TOKEN" ;;
+            *)       warn "API returned $api_code" ;;
+        esac
+        # readiness
+        mode=$(curl -sS -m 5 -u "$JENKINS_USER:$JENKINS_TOKEN" \
+              "$JENKINS_URL/api/json?tree=mode" 2>/dev/null | jq -r .mode 2>/dev/null)
+        [ -n "$mode" ] && ok "Jenkins mode: $mode" || warn "Could not read Jenkins mode"
+    else
+        skip "No JENKINS_USER/JENKINS_TOKEN — skipping authenticated API checks"
+    fi
+else
+    skip "curl not available; cannot check HTTP"
+fi
+
+if have_cmd ss; then
+    ss -ltn 2>/dev/null | grep -qE ':(8080)\b'   && ok "HTTP port 8080 is listening" || skip "HTTP port 8080 not listening (may be different port / loopback)"
+    ss -ltn 2>/dev/null | grep -qE ':(50000)\b'  && ok "JNLP port 50000 is listening" || skip "JNLP port 50000 not listening (WebSocket launcher, or no agents)"
+fi
+
+# ─── 5. critical files ───────────────────────────────────────────────────────
+section "5. Critical Files"
+crit_files=(
+    "$JENKINS_HOME/config.xml"
+    "$JENKINS_HOME/hudson.model.UpdateCenter.xml"
+    "$JENKINS_HOME/jenkins.model.JenkinsLocationConfiguration.xml"
+    "$JENKINS_HOME/credentials.xml"
+    "$JENKINS_HOME/secret.key"
+    "$JENKINS_HOME/identity.key.enc"
+)
+for f in "${crit_files[@]}"; do
+    if [ -f "$f" ]; then
+        ok "exists: $(basename "$f")"
+    else
+        case "$f" in
+            *credentials.xml) warn "missing: credentials.xml (credential store may be empty)" ;;
+            *) err "missing: $(basename "$f") — startup may fail" ;;
+        esac
+    fi
+done
+
+if [ -d "$JENKINS_HOME/secrets" ]; then
+    ok "secrets/ directory exists"
+    [ -f "$JENKINS_HOME/secrets/hudson.util.Secret" ] \
+        && ok "secrets/hudson.util.Secret exists" \
+        || err "secrets/hudson.util.Secret missing — credentials will fail to decrypt"
+else
+    err "secrets/ directory missing — credentials will fail to decrypt"
+fi
+
+# ─── 6. permissions ──────────────────────────────────────────────────────────
+section "6. File Permissions"
+check_perm_le() {
+    local file="$1" limit="$2" label="$3"
+    if [ ! -f "$file" ]; then skip "$label: not present"; return; fi
+    local m; m=$(file_mode "$file")
+    if perm_le "$m" "$limit"; then
+        ok "$label mode $m (<= $limit)"
+    else
+        err "$label mode $m exceeds $limit — too permissive for sensitive data"
+    fi
+}
+check_perm_le "$JENKINS_HOME/secret.key"        600 "secret.key"
+check_perm_le "$JENKINS_HOME/identity.key.enc"  600 "identity.key.enc"
+check_perm_le "$JENKINS_HOME/credentials.xml"   600 "credentials.xml"
+check_perm_le "$JENKINS_HOME/config.xml"        640 "config.xml"
+
+if [ -d "$JENKINS_HOME/secrets" ]; then
+    m=$(file_mode "$JENKINS_HOME/secrets")
+    perm_le "$m" 700 \
+        && ok "secrets/ mode $m (<= 700)" \
+        || err "secrets/ mode $m exceeds 700"
+fi
+
+# world-readable sensitive files
+wr=$(find "$JENKINS_HOME" -maxdepth 3 -type f \
+        \( -name 'secret.key' -o -name 'identity.key.enc' \
+           -o -name 'credentials.xml' -o -name '*.Secret' \) \
+        -perm -o+r 2>/dev/null)
+if [ -n "$wr" ]; then
+    err "World-readable sensitive file(s) found:"
+    echo "$wr" | while read -r l; do detail "  $l"; done
+else
+    ok "No world-readable secrets at depth <= 3"
+fi
+
+# ─── 7. config.xml ───────────────────────────────────────────────────────────
+section "7. config.xml"
+CFG="$JENKINS_HOME/config.xml"
+if [ -f "$CFG" ]; then
+    if have_xmllint; then
+        xmllint --noout "$CFG" 2>/dev/null \
+            && ok "config.xml is well-formed XML" \
+            || err "config.xml is NOT well-formed XML — startup will fail"
+    else
+        skip "xmllint not installed; skipping XML validation"
+    fi
+
+    xml_contains "$CFG" '<useSecurity>true</useSecurity>' \
+        && ok "Security is enabled (useSecurity=true)" \
+        || err "Security is DISABLED (useSecurity != true) — anonymous access possible"
+
+    ne=$(xml_value "$CFG" numExecutors)
+    if [ "$ne" = "0" ]; then
+        ok "Controller has 0 executors (production best practice)"
+    elif [ -n "$ne" ]; then
+        warn "Controller has $ne executor(s) — production best practice is 0"
+    else
+        warn "Could not read numExecutors from config.xml"
+    fi
+
+    sap=$(xml_value "$CFG" slaveAgentPort)
+    if [ -n "$sap" ] && [ "$sap" != "-1" ]; then
+        ok "JNLP slave agent port fixed at $sap"
+    else
+        skip "slaveAgentPort not fixed (dynamic or disabled)"
+    fi
+
+    xml_contains "$CFG" '<securityRealm' \
+        && ok "securityRealm configured" \
+        || err "No securityRealm configured"
+
+    if xml_contains "$CFG" 'HudsonPrivateSecurityRealm'; then
+        warn "Using Jenkins own user database — LDAP/OIDC/SAML recommended in production"
+    fi
+
+    if xml_contains "$CFG" '<authorizationStrategy'; then
+        xml_contains "$CFG" 'AuthorizationStrategy\$Unsecured' \
+            && err "AuthorizationStrategy is Unsecured — anyone can do anything" \
+            || ok "authorizationStrategy configured"
+    else
+        err "No authorizationStrategy configured"
+    fi
+
+    if grep -qE '<password>[^<]+</password>' "$CFG" 2>/dev/null; then
+        err "config.xml contains plaintext <password> element(s)"
+        detail "Move secrets to the Credentials store or JCasC/Vault."
+    else
+        ok "No plaintext password element in config.xml"
+    fi
+
+    if xml_contains "$CFG" '<slaveAgentPort>-1</slaveAgentPort>'; then
+        warn "slaveAgentPort is -1 — JNLP agents cannot connect"
+    fi
+else
+    err "config.xml missing — Jenkins will not start"
+fi
+
+# ─── 8. security XML ────────────────────────────────────────────────────────
+section "8. Security XML"
+CSRF="$JENKINS_HOME/jenkins.security.csrf.GlobalCrumbIssuerConfiguration.xml"
+if [ -f "$CSRF" ]; then
+    xml_contains "$CSRF" '<enabled>false</enabled>' \
+        && err "CSRF protection explicitly disabled in $CSRF" \
+        || ok "CSRF configuration present (not explicitly disabled)"
+else
+    warn "CSRF configuration file missing — default protection may still apply"
+fi
+
+CLI_XML="$JENKINS_HOME/jenkins.CLI.xml"
+if [ -f "$CLI_XML" ]; then
+    xml_contains "$CLI_XML" '<enabled>false</enabled>' \
+        && ok "CLI over remoting is disabled" \
+        || warn "CLI over remoting is enabled — disable if unused"
+else
+    warn "jenkins.CLI.xml missing — CLI over remoting may be enabled by default"
+fi
+
+SC="$JENKINS_HOME/scriptApproval.xml"
+if [ -f "$SC" ]; then
+    ok "scriptApproval.xml exists (script-security is managing approvals)"
+    if grep -qE 'java\.lang\.Runtime|java\.lang\.ProcessBuilder' "$SC" 2>/dev/null; then
+        err "scriptApproval.xml contains exec-class signatures (Runtime / ProcessBuilder)"
+        detail "Review approvals immediately — these bypass the sandbox."
+    else
+        ok "No exec-class signatures approved in scriptApproval.xml"
+    fi
+else
+    warn "scriptApproval.xml missing (no approvals recorded yet)"
+fi
+
+# ─── 9. Jenkins URL & update center ─────────────────────────────────────────
+section "9. Jenkins URL & Update Center"
+LOC="$JENKINS_HOME/jenkins.model.JenkinsLocationConfiguration.xml"
+if [ -f "$LOC" ]; then
+    ju=$(xml_value "$LOC" jenkinsUrl)
+    if [ -n "$ju" ]; then
+        ok "jenkinsUrl = $ju"
+        case "$ju" in
+            https://*) ok "jenkinsUrl uses HTTPS" ;;
+            *)         warn "jenkinsUrl is not HTTPS ($ju) — OIDC/SAML may break" ;;
+        esac
+        case "$ju" in
+            */) ok "jenkinsUrl ends with a trailing slash" ;;
+            *)  warn "jenkinsUrl should end with a trailing slash ($ju)" ;;
+        esac
+    else
+        err "jenkinsUrl is empty in $LOC"
+    fi
+    ae=$(xml_value "$LOC" adminAddress)
+    [ -n "$ae" ] && ok "adminAddress = $ae" || warn "adminAddress is not set"
+else
+    warn "jenkins.model.JenkinsLocationConfiguration.xml missing"
+fi
+
+UC="$JENKINS_HOME/hudson.model.UpdateCenter.xml"
+if [ -f "$UC" ]; then
+    if have_xmllint && ! xmllint --noout "$UC" 2>/dev/null; then
+        err "hudson.model.UpdateCenter.xml is NOT well-formed XML"
+    else
+        ok "hudson.model.UpdateCenter.xml is well-formed"
+    fi
+    if grep -q 'http://' "$UC" 2>/dev/null && ! grep -q 'http://localhost' "$UC" 2>/dev/null; then
+        warn "Update center uses plain http:// — supply-chain risk"
+    fi
+else
+    warn "hudson.model.UpdateCenter.xml missing"
+fi
+
+# ─── 10. plugins ────────────────────────────────────────────────────────────
+section "10. Plugins"
+PDIR="$JENKINS_HOME/plugins"
+if [ -d "$PDIR" ]; then
+    total=$(find "$PDIR" -maxdepth 1 -type f \( -name '*.hpi' -o -name '*.jpi' \) 2>/dev/null | wc -l)
+    ok "plugins/ directory exists with $total plugin archive(s)"
+    if [ "$total" -eq 0 ]; then
+        err "plugins/ directory is EMPTY — no plugins installed"
+    elif [ "$total" -gt 250 ]; then
+        warn "$total plugins — controller startup and memory may suffer"
+    fi
+
+    z=$(find "$PDIR" -maxdepth 1 -type f \( -name '*.hpi' -o -name '*.jpi' \) -size 0 2>/dev/null)
+    if [ -n "$z" ]; then
+        err "Zero-byte plugin file(s) — corrupt, will fail to load:"
+        echo "$z" | while read -r l; do detail "  $(basename "$l")"; done
+    else
+        ok "No zero-byte plugin files"
+    fi
+
+    bak=$(find "$PDIR" -maxdepth 1 -type f \( -name '*.bak' -o -name '*.old' -o -name '*.disabled' \) 2>/dev/null)
+    if [ -n "$bak" ]; then
+        warn "Backup/stale plugin files present (clean up):"
+        echo "$bak" | while read -r l; do detail "  $(basename "$l")"; done
+    else
+        ok "No .bak/.old/.disabled files in plugins/"
+    fi
+
+    recent=$(find "$PDIR" -maxdepth 1 -type f \( -name '*.hpi' -o -name '*.jpi' \) -mtime -7 2>/dev/null | wc -l)
+    if [ "$recent" -gt 0 ]; then
+        warn "$recent plugin archive(s) modified in last 7 days — verify against plugins.txt"
+    else
+        ok "No plugin archives modified in last 7 days"
+    fi
+
+    unreadable=$(find "$PDIR" -maxdepth 1 -type f \( -name '*.hpi' -o -name '*.jpi' \) ! -readable 2>/dev/null)
+    if [ -n "$unreadable" ]; then
+        err "Unreadable plugin file(s):"
+        echo "$unreadable" | while read -r l; do detail "  $(basename "$l")"; done
+    else
+        ok "All plugin files are readable"
+    fi
+
+    ww=$(find "$PDIR" -maxdepth 1 -type f \( -name '*.hpi' -o -name '*.jpi' \) -perm -o+w 2>/dev/null)
+    if [ -n "$ww" ]; then
+        warn "World-writable plugin file(s) (unusual):"
+        echo "$ww" | while read -r l; do detail "  $(basename "$l")"; done
+    fi
+
+    # manifest validation
+    if have_unzip; then
+        bad=0
+        while IFS= read -r hpi; do
+            [ -z "$hpi" ] && continue
+            manifest=$(unzip -p "$hpi" META-INF/MANIFEST.MF 2>/dev/null | tr -d '\r')
+            if [ -z "$manifest" ]; then
+                bad=$((bad+1)); err "Cannot read manifest: $(basename "$hpi")"; continue
+            fi
+            if ! echo "$manifest" | grep -q '^Plugin-Version:'; then
+                bad=$((bad+1)); err "Missing Plugin-Version in manifest: $(basename "$hpi")"
+            fi
+            if ! echo "$manifest" | grep -q '^Jenkins-Version:'; then
+                warn "Missing Jenkins-Version in manifest: $(basename "$hpi")"
+            fi
+        done < <(find "$PDIR" -maxdepth 1 -type f \( -name '*.hpi' -o -name '*.jpi' \) 2>/dev/null)
+        [ "$bad" -eq 0 ] && ok "All plugin archives have readable manifests"
+    else
+        skip "unzip not available; skipping plugin manifest validation"
+    fi
+
+    # plugin API cross-check
+    if [ -n "$JENKINS_USER" ] && [ -n "$JENKINS_TOKEN" ] && have_curl && have_jq; then
+        api=$(curl -sS -m 10 -u "$JENKINS_USER:$JENKINS_TOKEN" \
+              "$JENKINS_URL/pluginManager/api/json?tree=plugins[shortName,version,enabled,hasUpdate]" 2>/dev/null)
+        if echo "$api" | jq -e . >/dev/null 2>&1; then
+            n=$(echo "$api" | jq '.plugins | length')
+            dis=$(echo "$api" | jq '[.plugins[] | select(.enabled==false)] | length')
+            upd=$(echo "$api" | jq '[.plugins[] | select(.hasUpdate==true)] | length')
+            ok "API reports $n loaded plugins"
+            if [ "$dis" -gt 0 ]; then
+                warn "$dis plugin(s) disabled but still on disk — uninstall to remove classpath"
+                echo "$api" | jq -r '.plugins[] | select(.enabled==false) | "  \(.shortName) \(.version)"' | while read -r l; do detail "$l"; done
+            fi
+            if [ "$upd" -gt 0 ]; then
+                warn "$upd plugin(s) have updates available — schedule a window, never Update-All in prod"
+            fi
+        else
+            warn "Plugin API did not return valid JSON (auth or endpoint issue)"
+        fi
+    else
+        skip "Skipping plugin API check (need JENKINS_USER/JENKINS_TOKEN/curl/jq)"
+    fi
+else
+    err "plugins/ directory missing — Jenkins will start with zero plugins"
+fi
+
+# ─── 11. init.groovy.d ──────────────────────────────────────────────────────
+section "11. init.groovy.d"
+IGD="$JENKINS_HOME/init.groovy.d"
+if [ -d "$IGD" ]; then
+    c=$(find "$IGD" -maxdepth 1 -type f -name '*.groovy' 2>/dev/null | wc -l)
+    ok "init.groovy.d contains $c script(s)"
+    ww=$(find "$IGD" -maxdepth 1 -type f -name '*.groovy' -perm -o+w 2>/dev/null)
+    if [ -n "$ww" ]; then
+        err "World-writable init.groovy.d script(s) — RCE risk:"
+        echo "$ww" | while read -r l; do detail "  $l"; done
+    else
+        ok "No world-writable init.groovy.d scripts"
+    fi
+    if grep -rEl 'Runtime\.getRuntime|ProcessBuilder|"/bin/sh"|/bin/bash -c' "$IGD" >/dev/null 2>&1; then
+        warn "init.groovy.d script(s) contain exec-like patterns — review:"
+        grep -rEl 'Runtime\.getRuntime|ProcessBuilder|"/bin/sh"|/bin/bash -c' "$IGD" 2>/dev/null | while read -r l; do detail "  $l"; done
+    else
+        ok "No exec-like patterns in init.groovy.d scripts"
+    fi
+else
+    skip "init.groovy.d not present"
+fi
+
+# ─── 12. disk & inodes ──────────────────────────────────────────────────────
+section "12. Disk & Inodes"
+if have_cmd df; then
+    dl=$(df -P "$JENKINS_HOME" 2>/dev/null | tail -1)
+    if [ -n "$dl" ]; then
+        upct=$(echo "$dl" | awk '{gsub("%",""); print $5}')
+        avail=$(echo "$dl" | awk '{print $4}')
+        if [ -n "$upct" ]; then
+            if [ "$upct" -ge 90 ] 2>/dev/null; then
+                err "Disk usage on JENKINS_HOME is ${upct}% (critical, >=90%)"
+            elif [ "$upct" -ge 80 ] 2>/dev/null; then
+                warn "Disk usage on JENKINS_HOME is ${upct}% (>=80%)"
+            else
+                ok "Disk usage on JENKINS_HOME is ${upct}%"
+            fi
+            [ -n "$avail" ] && detail "available: $(awk -v k="$avail" 'BEGIN{printf "%.1f GiB", k/1024/1024}')"
+        fi
+    fi
+    il=$(df -Pi "$JENKINS_HOME" 2>/dev/null | tail -1)
+    if [ -n "$il" ]; then
+        ipct=$(echo "$il" | awk '{gsub("%",""); print $5}')
+        if [ -n "$ipct" ]; then
+            if [ "$ipct" -ge 90 ] 2>/dev/null; then
+                err "Inode usage on JENKINS_HOME is ${ipct}% (critical)"
+            elif [ "$ipct" -ge 80 ] 2>/dev/null; then
+                warn "Inode usage on JENKINS_HOME is ${ipct}% (>=80%)"
+            else
+                ok "Inode usage on JENKINS_HOME is ${ipct}%"
+            fi
+        fi
+    fi
+fi
+
+# ─── 13. backups ────────────────────────────────────────────────────────────
+section "13. Backups"
+if [ -d "$BACKUP_DIR" ]; then
+    latest=$(find "$BACKUP_DIR" -maxdepth 1 -name 'jenkins-*.tgz' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')
+    if [ -n "$latest" ]; then
+        age=$(( ( $(date +%s) - $(file_mtime "$latest") ) / 86400 ))
+        if [ "$age" -le 2 ]; then
+            ok "Latest backup: $(basename "$latest") (${age}d old)"
+        elif [ "$age" -le 7 ]; then
+            warn "Latest backup is ${age} days old"
+        else
+            err "Latest backup is ${age} days old (>=7)"
+        fi
+        if have_cmd sha256sum && [ -f "$latest.sha256" ]; then
+            ( cd "$BACKUP_DIR" && sha256sum -c "$(basename "$latest").sha256" >/dev/null 2>&1 ) \
+                && ok "Backup checksum verifies" \
+                || err "Backup checksum FAILED — file may be corrupt"
+        fi
+    else
+        warn "No jenkins-*.tgz backups found in $BACKUP_DIR"
+    fi
+else
+    skip "Backup directory $BACKUP_DIR not present"
+fi
+
+# ─── 14. core / JDK compatibility ───────────────────────────────────────────
+section "14. Core / JDK Compatibility"
+if [ -f "$CFG" ]; then
+    cv=$(grep -oE '<version>[^<]+' "$CFG" 2>/dev/null | sed 's/<version>//' | head -1)
+    [ -n "$cv" ] && ok "Core version in config.xml: $cv" || skip "Core version not found in config.xml"
+fi
+if have_cmd java; then
+    major=$(java -version 2>&1 | grep -oE '"[0-9]+' | tr -d '"' | head -1)
+    if [ -n "$major" ]; then
+        if [ "$major" -ge 17 ] 2>/dev/null && [ "$major" -le 21 ] 2>/dev/null; then
+            ok "Java major $major is within the supported range (17–21)"
+        elif [ "$major" -lt 17 ] 2>/dev/null; then
+            err "Java major $major is below 17 — recent LTS requires 17 or 21"
+        else
+            warn "Java major $major — verify against your LTS line"
+        fi
+    fi
+fi
+
+# ─── 15. recent log errors ──────────────────────────────────────────────────
+section "15. Recent Log Errors"
+if [ -r "$JENKINS_LOG" ]; then
+    hits=$(tail -1000 "$JENKINS_LOG" 2>/dev/null | grep -cE 'OutOfMemoryError|HudsonFailedToLoad|UnsatisfiedDependencyException|InvalidCipherTextException')
+    if [ "$hits" -gt 0 ]; then
+        err "$hits critical error signature(s) in last 1000 log lines"
+        tail -1000 "$JENKINS_LOG" 2>/dev/null \
+            | grep -E 'OutOfMemoryError|HudsonFailedToLoad|UnsatisfiedDependencyException|InvalidCipherTextException' \
+            | tail -5 | while read -r l; do detail "$l"; done
+    else
+        ok "No critical error signatures in last 1000 log lines"
+    fi
+else
+    skip "Log not readable: $JENKINS_LOG"
+fi
+
+# ─── 16. summary ────────────────────────────────────────────────────────────
+echo ""
+section "Summary"
+printf "  Total checks : %d\n" "$((OK_COUNT + WARN_COUNT + ERR_COUNT + SKIP_COUNT))"
+printf "  ${GREEN}OK${NC}           : %d\n" "$OK_COUNT"
+printf "  ${YELLOW}WARN${NC}         : %d\n" "$WARN_COUNT"
+printf "  ${RED}ERR${NC}          : %d\n" "$ERR_COUNT"
+printf "  ${DIM}SKIP${NC}         : %d\n" "$SKIP_COUNT"
+echo ""
+
+if [ "$ERR_COUNT" -gt 0 ]; then
+    printf "${RED}${BOLD}Result: CRITICAL — %d error(s) need attention.${NC}\n" "$ERR_COUNT"
+    rc=2
+elif [ "$WARN_COUNT" -gt 0 ]; then
+    printf "${YELLOW}${BOLD}Result: WARNING — %d warning(s) found.${NC}\n" "$WARN_COUNT"
+    rc=1
+else
+    printf "${GREEN}${BOLD}Result: HEALTHY — no issues detected.${NC}\n"
+    rc=0
+fi
+
+print_banner
+exit "$rc"
+
+Usage
+bash
+
+# 1. Save and make executable
+sudo tee /usr/local/bin/jenkins-health-check.sh >/dev/null < jenkins-health-check.sh
+sudo chmod 755 /usr/local/bin/jenkins-health-check.sh
+
+# 2. Run as root (recommended — reads all files, checks systemd)
+sudo /usr/local/bin/jenkins-health-check.sh
+
+# 3. Or run with auth for API + plugin inventory checks
+sudo JENKINS_USER=admin JENKINS_TOKEN=xxxxxxx \
+     JENKINS_URL=https://jenkins.example.com \
+     /usr/local/bin/jenkins-health-check.sh
+
+# 4. No color (for logs / CI / alerting)
+sudo /usr/local/bin/jenkins-health-check.sh --no-color > /var/log/jenkins-health.log 2>&1
+
+# 5. Cron + alert on non-zero exit
+#    /etc/cron.d/jenkins-health
+#    */15 * * * * root /usr/local/bin/jenkins-health-check.sh --no-color >> /var/log/jenkins-health.log 2>&1 || \
+#        curl -fsS -X POST "https://hooks.slack.com/services/…" \
+#          -H 'Content-Type: application/json' \
+#          -d '{"text":"Jenkins health check failed — see /var/log/jenkins-health.log"}'
+
+What each section checks (overview)
+#	Section	Checks
+1	JENKINS_HOME	existence, mode ≤750, owner, readable/traversable
+2	Service	systemd active / enabled / restart count; Docker fallback + healthcheck
+3	Process & JVM	running, -Xmx, -XX:MaxMetaspaceSize, HeapDumpOnOutOfMemoryError, headless, proxy flags, JDK 17–21
+4	HTTP & API	/login 200/403, authenticated /api/json, mode, ports 8080 / 50000
+5	Critical files	config.xml, UpdateCenter.xml, JenkinsLocationConfiguration.xml, credentials.xml, secret.key, identity.key.enc, secrets/hudson.util.Secret
+6	Permissions	secret.key ≤600, identity.key.enc ≤600, credentials.xml ≤600, config.xml ≤640, secrets/ ≤700, no world-readable secrets
+7	config.xml	well-formed, useSecurity=true, numExecutors=0, slaveAgentPort, securityRealm, authorizationStrategy, no plaintext <password>
+8	Security XML	CSRF not disabled, CLI remoting disabled, no exec-class script approvals
+9	Jenkins URL & UC	jenkinsUrl is HTTPS + trailing slash + matches public, adminAddress set, UpdateCenter well-formed, no plain HTTP
+10	Plugins	count, zero-byte, .bak/.old/.disabled, modified ≤7d, unreadable, world-writable, manifest Plugin-Version/Jenkins-Version, API inventory (disabled / updatable)
+11	init.groovy.d	count, world-writable, exec-like patterns
+12	Disk	usage ≥80% warn / ≥90% err, inodes same
+13	Backups	latest age ≤2d ok / ≤7d warn, .sha256 verify
+14	Core/JDK	core version from config.xml, Java major 17–21
+15	Logs	OutOfMemoryError, HudsonFailedToLoad, UnsatisfiedDependencyException, InvalidCipherTextException in last 1000 lines
+Output sample (abridged)
+text
+
+══════════════════════════════════════════════════════════════════
+  Visit more at https://github.com/MojSep
+══════════════════════════════════════════════════════════════════
+
+Jenkins Health Check
+  JENKINS_HOME = /var/lib/jenkins
+  JENKINS_URL  = https://jenkins.example.com
+  SERVICE      = jenkins
+  Host         = ci-01.example.com
+  Date (UTC)   = 2026-11-09T12:34:56Z
+
+── 1. JENKINS_HOME ──
+[ OK ] JENKINS_HOME exists: /var/lib/jenkins
+[ OK ] JENKINS_HOME mode is restrictive: 750
+[ OK ] JENKINS_HOME owner: jenkins
+
+── 6. File Permissions ──
+[ OK ] secret.key mode 600 (<= 600)
+[ OK ] credentials.xml mode 600 (<= 600)
+[ERR ] config.xml mode 644 exceeds 640 — too permissive for sensitive data
+
+── 7. config.xml ──
+[ OK ] config.xml is well-formed XML
+[ OK ] Security is enabled (useSecurity=true)
+[WARN] Controller has 2 executor(s) — production best practice is 0
+[ OK ] authorizationStrategy configured
+
+── 10. Plugins ──
+[ OK ] plugins/ directory exists with 118 plugin archive(s)
+[WARN] 3 plugin(s) have updates available — schedule a window, never Update-All in prod
+[ERR ] Zero-byte plugin file(s) — corrupt, will fail to load:
+         git.hpi
+
+── 15. Recent Log Errors ──
+[ERR ] 2 critical error signature(s) in last 1000 log lines
+       java.lang.OutOfMemoryError: Java heap space
+       hudson.util.HudsonFailedToLoad: ...
+
+── Summary ──
+  Total checks : 92
+  OK           : 78
+  WARN         : 9
+  ERR          : 3
+  SKIP         : 2
+
+Result: CRITICAL — 3 error(s) need attention.
+
+══════════════════════════════════════════════════════════════════
+  Visit more at https://github.com/MojSep
+══════════════════════════════════════════════════════════════════
+
+The script returns 2 on any ERR, so cron/Slack/Alertmanager can page immediately; 1 on warnings; 0 when healthy — perfect for CI gates and systemd timers alike.

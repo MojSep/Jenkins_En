@@ -1,0 +1,837 @@
+﻿Jenkins on Linux — Complete Installation Cheat Sheet (Online & Offline / Air-Gapped)
+
+    Scope: Debian/Ubuntu, RHEL/Rocky/Alma/CentOS, SUSE, Docker, Kubernetes, generic WAR. All commands assume root or sudo. Verified against Jenkins LTS 2.4xx (Java 17/21) and 2.46x (Java 11/17).
+
+0. Prerequisites & Compatibility Matrix
+Component	Requirement	Notes
+Java	LTS ≤ 2.463: Java 11 or 17 · LTS ≥ 2.479: Java 17 or 21 (Java 11 dropped)	java -version must be a supported JDK/Temurin
+CPU/RAM	≥ 2 vCPU / 4 GB RAM (controller)	Scale with agents offloaded
+Disk	≥ 50 GB for $JENKINS_HOME	Builds/artifacts grow fast
+Ports	8080 (HTTP), 50000 (JNLP agents)	Change via --httpPort / -Dhudson.TcpSlaveAgentListener.port
+User	Dedicated jenkins system user	Never run as root
+OS	systemd-based (most modern distros)	SysV still supported
+Time	chronyd/systemd-timesyncd synced	TOTP/CSRF/agent certs depend on clock
+Filesystem	POSIX, supports chmod 600	Avoid NFS for $JENKINS_HOME (locking)
+Compatibility check
+bash
+
+uname -a
+cat /etc/os-release
+java -version 2>&1
+free -h
+df -h /
+timedatectl status
+
+Supported install methods at a glance
+Method	Online	Offline	Best for
+apt repo (Debian/Ubuntu)	✅	✅ (mirror/cache)	Standard servers
+dnf/yum repo (RHEL family)	✅	✅ (local repo)	Enterprise RHEL
+zypper (SUSE)	✅	✅	SUSE
+Docker / Podman image	✅	✅ (docker save/load)	Containers
+Kubernetes Helm	✅	✅ (private registry)	K8s
+WAR + systemd unit	✅	✅	Full control
+Snap	✅	⚠️ limited	Dev only
+1. Online Install — Debian / Ubuntu
+1.1 Add repo + install (one-liner)
+bash
+
+# 1. Java 17 (Temurin) — required for LTS 2.479+
+sudo apt-get update
+sudo apt-get install -y fontconfig openjdk-17-jre-headless
+# or Temurin:
+# sudo apt-get install -y wget apt-transport-https gpg
+# wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+#   | sudo gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg
+# echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" \
+#   | sudo tee /etc/apt/sources.list.d/adoptium.list
+# sudo apt-get update && sudo apt-get install -y temurin-17-jdk
+
+# 2. Jenkins repo
+sudo mkdir -p /etc/apt/keyrings
+sudo wget -O /etc/apt/keyrings/jenkins-keyring.asc \
+  https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] \
+  https://pkg.jenkins.io/debian-stable binary/" \
+  | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y jenkins
+
+1.2 Pin version (reproducible ops)
+bash
+
+apt-cache policy jenkins                 # list available versions
+sudo apt-get install -y jenkins=2.479.1 # pin exact
+sudo apt-mark hold jenkins               # prevent auto-upgrade
+
+1.3 Files created by the package
+text
+
+/etc/default/jenkins                    # JENKINS_HOME, JENKINS_PORT, JENKINS_ARGS, JAVA_ARGS
+/usr/lib/systemd/system/jenkins.service
+/usr/share/jenkins/jenkins.war
+/var/lib/jenkins/                       # JENKINS_HOME
+/var/log/jenkins/jenkins.log
+/var/cache/jenkins/war/                 # exploded WAR
+
+1.4 Start + initial unlock
+bash
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins
+sudo systemctl status jenkins --no-pager
+
+# initial admin password
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+# browse http://<host>:8080/  → paste password → install suggested plugins → create admin
+
+1.5 Override port / JVM opts safely
+
+Edit /etc/default/jenkins:
+bash
+
+JENKINS_PORT="8080"
+JENKINS_LISTEN_ADDRESS="0.0.0.0"
+JAVA_ARGS="-Djava.awt.headless=true -Xms2g -Xmx4g \
+  -Djenkins.model.Jenkins.logStartupPerformance=true"
+JENKINS_ARGS="--webroot=/var/cache/jenkins/war --httpPort=$JENKINS_PORT"
+
+Better: use a systemd drop-in so package upgrades don't clobber it:
+bash
+
+sudo systemctl edit jenkins
+# [Service]
+# Environment="JAVA_ARGS=-Xms2g -Xmx4g -Djava.awt.headless=true"
+# UMask=0027
+sudo systemctl daemon-reload && sudo systemctl restart jenkins
+
+2. Online Install — RHEL / Rocky / Alma / CentOS Stream
+bash
+
+# 1. Java 17 (Temurin or RHEL's java-17-openjdk)
+sudo dnf install -y fontconfig java-17-openjdk-headless
+# or Temurin:
+# sudo dnf install -y https://packages.adoptium.net/artifactory/rpm/.../temurin-17-jdk.rpm
+
+# 2. Jenkins repo
+sudo wget -O /etc/yum.repos.d/jenkins.repo \
+  https://pkg.jenkins.io/redhat-stable/jenkins.repo
+
+sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+
+# 3. Install
+sudo dnf upgrade -y
+sudo dnf install -y jenkins
+
+# 4. Enable + start
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins
+sudo systemctl status jenkins
+
+# 5. Unlock
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+RHEL specifics
+
+    Config file: /etc/sysconfig/jenkins (older) — newer packages use systemd Environment= / EnvironmentFile=.
+
+    SELinux: getenforce → if Enforcing, see §11.
+
+    Firewall: sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload
+
+Pin version on RPM
+bash
+
+sudo dnf --showduplicates list jenkins
+sudo dnf install -y jenkins-2.479.1-1.1
+sudo dnf versionlock add jenkins   # requires dnf-plugin-versionlock
+
+SUSE
+bash
+
+sudo zypper addrepo -f https://pkg.jenkins.io/opensuse-stable/ jenkins
+sudo zypper --no-gpg-checks install -y jenkins
+sudo systemctl enable --now jenkins
+
+3. Online Install — Docker (official image)
+bash
+
+# 1. Create persistent volume
+docker volume create jenkins_home
+
+# 2. Run LTS (pinned tag — NEVER use :latest in prod)
+docker run -d --name jenkins \
+  --restart=on-failure \
+  -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home \
+  -v /etc/localtime:/etc/localtime:ro \
+  -e JAVA_OPTS="-Djenkins.install.runSetupWizard=true -Xmx4g" \
+  -e TZ=Asia/Tehran \
+  --ulimit nofile=65536:65536 \
+  jenkins/jenkins:2.479.1-lts-jdk17
+
+# 3. Unlock password
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+# browse http://localhost:8080/
+
+Pin image digest (supply-chain safe)
+bash
+
+docker pull jenkins/jenkins:2.479.1-lts-jdk17
+docker inspect --format='{{index .RepoDigests 0}}' jenkins/jenkins:2.479.1-lts-jdk17
+# use jenkins/jenkins@sha256:... in compose/k8s
+
+docker-compose.yml template
+yaml
+
+services:
+  jenkins:
+    image: jenkins/jenkins:2.479.1-lts-jdk17
+    container_name: jenkins
+    restart: unless-stopped
+    user: "1000:1000"
+    ports: ["8080:8080", "50000:50000"]
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      TZ: Asia/Tehran
+      JAVA_OPTS: "-Xms2g -Xmx4g -Djava.awt.headless=true"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+volumes:
+  jenkins_home:
+
+Podman (rootless) variant
+bash
+
+podman volume create jenkins_home
+podman run -d --name jenkins \
+  -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home:Z \
+  --userns=keep-id \
+  docker.io/jenkins/jenkins:2.479.1-lts-jdk17
+
+4. Online Install — Kubernetes / Helm
+bash
+
+# 1. Add repo
+helm repo add jenkins https://charts.jenkins.io
+helm repo update
+
+# 2. Create values.yaml (minimal secure)
+cat > values.yaml <<'EOF'
+controller:
+  image:
+    tag: "2.479.1"
+  admin:
+    existingSecret: jenkins-admin
+    userKey: jenkins-admin-user
+    passwordKey: jenkins-admin-password
+  installPlugins:
+    - kubernetes:4287.v98a_8f9b_2a_1d
+    - workflow-aggregator:600.vb_57cdd26fdd7
+    - git:5.7.0
+    - configuration-as-code:1921.vd6b_89e0e6c3
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits:   { cpu: "2",    memory: "4Gi" }
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hostName: jenkins.example.com
+    tls:
+      - secretName: jenkins-tls
+        hosts: [jenkins.example.com]
+persistence:
+  enabled: true
+  size: 50Gi
+  storageClass: fast-ssd
+EOF
+
+# 3. Admin secret (never use chart defaults in prod)
+kubectl create namespace jenkins
+kubectl -n jenkins create secret generic jenkins-admin \
+  --from-literal=jenkins-admin-user=admin \
+  --from-literal=jenkins-admin-password="$(openssl rand -base64 24)"
+
+# 4. Install
+helm upgrade --install jenkins jenkins/jenkins \
+  -n jenkins -f values.yaml --atomic --timeout 15m
+
+Air-gapped K8s
+
+    Mirror jenkins/jenkins + jenkins/inbound-agent to private registry.
+
+    helm pull jenkins/jenkins --untar → push chart OCI to registry → helm install oci://….
+
+    controller.installPlugins pulls from public update center → for air-gap, use init container that copies .hpi files from an internal artifact server, or pre-bake a custom image (see §8).
+
+5. Online Install — Generic WAR (any distro)
+bash
+
+# 1. JDK
+sudo apt-get install -y openjdk-17-jre-headless   # or dnf install java-17-openjdk-headless
+
+# 2. User + dirs
+sudo useradd --system --create-home --home-dir /var/lib/jenkins --shell /bin/bash jenkins
+sudo mkdir -p /opt/jenkins /var/lib/jenkins
+sudo chown -R jenkins:jenkins /opt/jenkins /var/lib/jenkins
+
+# 3. WAR (pinned)
+VER=2.479.1
+sudo -u jenkins curl -fsSL -o /opt/jenkins/jenkins.war \
+  "https://get.jenkins.io/war-stable/${VER}/jenkins.war"
+sudo -u jenkins sha256sum -c <(echo "$(curl -fsSL https://get.jenkins.io/war-stable/${VER}/jenkins.war.sha256)  /opt/jenkins/jenkins.war")
+
+# 4. systemd unit
+sudo tee /etc/systemd/system/jenkins.service >/dev/null <<'EOF'
+[Unit]
+Description=Jenkins Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jenkins
+Group=jenkins
+Environment="JENKINS_HOME=/var/lib/jenkins"
+Environment="JAVA_OPTS=-Xms2g -Xmx4g -Djava.awt.headless=true -Dhudson.lifecycle=hudson.lifecycle.ExitLifecycle"
+Environment="JENKINS_OPTS=--httpPort=8080 --prefix=/"
+UMask=0027
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/jenkins/jenkins.war $JENKINS_OPTS
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins
+sudo journalctl -u jenkins -f
+
+6. Offline Install — Debian/Ubuntu (air-gapped)
+
+    Strategy: on an internet-connected staging host with the same arch/OS, download the .deb + all dependencies. Transfer via USB/internal mirror. Install with dpkg -i / apt install --no-download.
+
+6.1 Prepare on the online staging host
+bash
+
+# Install build tooling
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# Add repos (same as online section §1.1)
+sudo mkdir -p /etc/apt/keyrings
+sudo wget -O /etc/apt/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" \
+  | sudo tee /etc/apt/sources.list.d/jenkins.list
+sudo apt-get update
+
+# Download jenkins + ALL deps into /tmp/bundle
+mkdir -p /tmp/bundle
+cd /tmp/bundle
+apt-get download jenkins
+apt-get install --print-uris -y jenkins | awk -F"'" '/^'"'"'http/{print $2}' > urls.txt
+# simpler & robust: use apt-offline or:
+apt-get -y install --download-only \
+  -o Dir::Cache::archives=/tmp/bundle jenkins
+
+# also grab Java (17) if not preinstalled on target
+apt-get -y install --download-only \
+  -o Dir::Cache::archives=/tmp/bundle openjdk-17-jre-headless
+
+6.2 Bundle + verify checksums
+bash
+
+cd /tmp/bundle
+sha256sum *.deb > SHA256SUMS
+tar czf jenkins-offline-deb-$(date +%F).tgz *.deb SHA256SUMS
+# transfer to target: scp / usb / scp to jump host
+
+6.3 Install on the target (air-gapped)
+bash
+
+# verify
+sha256sum -c SHA256SUMS
+
+# install all debs in one shot (resolves order automatically)
+sudo dpkg -i *.deb || sudo apt-get -f install -y
+# or fully local:
+sudo apt install -y --no-download ./*.deb
+
+# service
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins
+sudo systemctl status jenkins
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+6.4 Local APT mirror alternative (large fleets)
+bash
+
+# on a repo host
+apt-get install -y aptly
+aptly repo create -distribution=bookworm -component=main jenkins-repo
+aptly repo add jenkins-repo /tmp/bundle/*.deb
+aptly publish repo -architectures=amd64 jenkins-repo
+
+# on targets: point sources.list to http://repo.internal/jenkins-repo bookworm main
+
+7. Offline Install — RHEL / Rocky / Alma
+7.1 Download RPMs on staging host
+bash
+
+# Enable repo (same as §2)
+sudo wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+
+# Download Jenkins + all deps
+mkdir -p /tmp/bundle && cd /tmp/bundle
+sudo dnf download --resolve --alldeps --destdir /tmp/bundle jenkins java-17-openjdk-headless
+
+# Also grab required base deps if missing
+sudo dnf download --resolve --alldeps --destdir /tmp/bundle \
+  fontconfig dejavu-sans-fonts
+
+sha256sum *.rpm > SHA256SUMS
+tar czf jenkins-offline-rpm-$(date +%F).tgz *.rpm SHA256SUMS
+
+7.2 Install on target
+bash
+
+# verify
+sha256sum -c SHA256SUMS
+
+# local install
+sudo dnf install -y ./*.rpm
+# or
+sudo rpm -Uvh --nodeps ./*.rpm   # last resort only
+
+# service
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+7.3 Local yum/dnf repo (fleet)
+bash
+
+# on repo host
+sudo dnf install -y createrepo_c
+sudo cp /tmp/bundle/*.rpm /var/www/html/jenkins-repo/
+sudo createrepo_c /var/www/html/jenkins-repo/
+
+# on target
+sudo tee /etc/yum.repos.d/jenkins-local.repo >/dev/null <<'EOF'
+[jenkins-local]
+name=Jenkins Local Mirror
+baseurl=http://repo.internal/jenkins-repo/
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install -y jenkins
+
+8. Offline Install — WAR + Plugins (fully air-gapped)
+8.1 Download WAR + SHA256
+bash
+
+VER=2.479.1
+mkdir -p /tmp/jenkins-offline && cd /tmp/jenkins-offline
+curl -fsSLO "https://get.jenkins.io/war-stable/${VER}/jenkins.war"
+curl -fsSLO "https://get.jenkins.io/war-stable/${VER}/jenkins.war.sha256"
+sha256sum -c jenkins.war.sha256
+
+8.2 Download plugins + their dependencies
+
+Use the plugin-installation-manager-tool (Jenkins' official CLI) — it resolves the dependency graph:
+bash
+
+# on staging host
+curl -fsSL -o jenkins-plugin-manager.jar \
+  https://github.com/jenkinsci/plugin-installation-manager-tool/releases/latest/download/jenkins-plugin-manager.jar
+
+cat > plugins.txt <<'EOF'
+configuration-as-code
+kubernetes
+workflow-aggregator
+git
+credentials-binding
+pipeline-stage-view
+blueocean
+role-strategy
+matrix-auth
+antisamy-markup-formatter
+EOF
+
+mkdir -p /tmp/jenkins-offline/plugins
+java -jar jenkins-plugin-manager.jar \
+  --war /tmp/jenkins-offline/jenkins.war \
+  --plugin-download-directory /tmp/jenkins-offline/plugins \
+  --plugin-file plugins.txt \
+  --latest false \
+  --verbose
+
+# → /tmp/jenkins-offline/plugins/*.hpi  (deps auto-included)
+sha256sum plugins/*.hpi > plugins/SHA256SUMS
+tar czf jenkins-offline-plugins.tgz plugins/ jenkins.war jenkins.war.sha256
+
+8.3 Install on air-gapped target
+bash
+
+# 1. WAR + service unit (reuse §5.4)
+sudo mkdir -p /opt/jenkins && sudo cp jenkins.war /opt/jenkins/
+sudo chown -R jenkins:jenkins /opt/jenkins
+
+# 2. Plugins into JENKINS_HOME/plugins BEFORE first start
+sudo mkdir -p /var/lib/jenkins/plugins
+sudo cp -v plugins/*.hpi /var/lib/jenkins/plugins/
+sudo chown -R jenkins:jenkins /var/lib/jenkins
+
+# 3. Prevent "Update Center unreachable" noise — disable update site
+sudo -u jenkins mkdir -p /var/lib/jenkins/updates
+cat <<'EOF' | sudo -u jenkins tee /var/lib/jenkins/hudson.model.UpdateCenter.xml
+<?xml version='1.1' encoding='UTF-8'?>
+<sites>
+  <site>
+    <id>default</id>
+    <url>file:/opt/jenkins/updates/update-center.json</url>
+  </site>
+</sites>
+EOF
+# (point to a local copy of update-center.json if you want offline plugin upgrades)
+
+# 4. Start
+sudo systemctl daemon-reload && sudo systemctl enable --now jenkins
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+8.4 Local plugin update center (recommended for fleets)
+
+On a repo host:
+bash
+
+mkdir -p /var/www/html/jenkins-uc
+cd /var/www/html/jenkins-uc
+# copy update-center.json from https://updates.jenkins.io/update-center.json
+# rewrite plugin "url" fields to your mirror:
+sed -i 's#https://updates.jenkins.io/download#http://repo.internal/jenkins-uc#g' update-center.json
+
+On targets: set hudson.model.UpdateCenter.xml → http://repo.internal/jenkins-uc/update-center.json, and (important) set the Update Site to https or sign it — otherwise Jenkins refuses.
+8.5 Pre-baked Docker image for air-gap
+dockerfile
+
+FROM jenkins/jenkins:2.479.1-lts-jdk17
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt \
+    --latest false --clean-target-dir
+# ship on USB: docker save jenkins-custom:1.0 | gzip > jenkins-custom.tgz
+
+On target:
+bash
+
+gunzip -c jenkins-custom.tgz | docker load
+docker run -d --name jenkins -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home jenkins-custom:1.0
+
+9. Post-Install Configuration (all methods)
+9.1 First login
+bash
+
+sudo cat $JENKINS_HOME/secrets/initialAdminPassword
+# http://host:8080/ → Unlock → Install suggested plugins → Create admin
+
+9.2 Config-as-Code (JCasC) — production baseline
+
+Create $JENKINS_HOME/jenkins.yaml (or mount /var/jenkins_config/jenkins.yaml and set CASC_JENKINS_CONFIG):
+yaml
+
+jenkins:
+  systemMessage: "Managed by JCasC — do not edit via UI"
+  numExecutors: 0                   # controller builds nothing
+  mode: NORMAL
+  securityRealm:
+    ldap:
+      configurations:
+        - server: "ldaps://ldap.internal:636"
+          rootDN: "dc=example,dc=com"
+          userSearchBase: "ou=people"
+          userSearch: "uid={0}"
+          groupSearchBase: "ou=groups"
+          managerDN: "${LDAP_BIND_DN}"
+          managerPasswordSecret: "${LDAP_BIND_PW}"
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: admin
+            permissions: ["Overall/Administer"]
+            assignments: ["admins"]
+          - name: developer
+            permissions: ["Overall/Read","Job/Build","Job/Read"]
+            assignments: ["devs"]
+  clouds:
+    - kubernetes:
+        name: k8s
+        serverUrl: "https://kubernetes.default.svc"
+        namespace: jenkins-agents
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "sonar-token"
+              secret: "${SONAR_TOKEN}"
+
+Reload:
+bash
+
+# via UI: Manage → Configuration as Code → Reload existing configuration
+# via API:
+curl -u admin:$TOKEN -X POST https://jenkins.example.com/configuration-as-code/reload
+# or via CLI:
+java -jar jenkins-cli.jar -s https://jenkins.example.com -auth admin:$TOKEN reload-configuration
+
+9.3 Disable setup wizard (pre-seeded deployments)
+bash
+
+echo 2.479.1 | sudo -u jenkins tee /var/lib/jenkins/jenkins.install.UpgradeWizard.state
+sudo -u jenkins touch /var/lib/jenkins/jenkins.install.InstallUtil.lastExecVersion
+# OR pass -Djenkins.install.runSetupWizard=false
+
+9.4 Create admin via Groovy (no UI)
+
+$JENKINS_HOME/init.groovy.d/01-admin.groovy:
+groovy
+
+import jenkins.model.*
+import hudson.security.*
+import jenkins.security.s2m.AdminWhitelistRule
+
+def instance = Jenkins.getInstance()
+def realm = new HudsonPrivateSecurityRealm(false)
+realm.createAccount(System.getenv("JENKINS_ADMIN_USER") ?: "admin",
+                    System.getenv("JENKINS_ADMIN_PASSWORD"))
+instance.setSecurityRealm(realm)
+instance.setAuthorizationStrategy(new FullControlOnceLoggedInAuthorizationStrategy())
+instance.save()
+
+9.5 Port / JVM tuning summary
+Knob	Where
+--httpPort=8080	JENKINS_ARGS in /etc/default/jenkins or systemd Environment=
+--httpsPort=8443 --httpsKeyStore=…	same, for native TLS
+--prefix=/jenkins	context path behind reverse proxy
+--httpListenAddress=127.0.0.1	bind loopback when behind nginx
+-Xms2g -Xmx4g	JAVA_OPTS
+-Dhudson.TcpSlaveAgentListener.port=50000	JNLP port
+-Djenkins.model.Jenkins.logStartupPerformance=true	startup diagnostics
+10. Reverse Proxy + TLS
+nginx (recommended)
+nginx
+
+upstream jenkins { server 127.0.0.1:8080; keepalive 32; }
+
+server {
+  listen 80;
+  server_name jenkins.example.com;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl http2;
+  server_name jenkins.example.com;
+
+  ssl_certificate     /etc/ssl/certs/jenkins.crt;
+  ssl_certificate_key /etc/ssl/private/jenkins.key;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+
+  # larger uploads for artifacts/workspaces
+  client_max_body_size 100m;
+
+  location / {
+    proxy_pass         http://jenkins;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_set_header   X-Forwarded-Host  $host;
+    proxy_set_header   X-Forwarded-Port  $server_port;
+    proxy_set_header   Upgrade           $http_upgrade;
+    proxy_set_header   Connection        "upgrade";
+
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering    off;           # SSE / pipeline logs
+  }
+}
+
+In Jenkins: Manage → System → Jenkins URL = https://jenkins.example.com/ (or set in jenkins.model.JenkinsLocationConfiguration.xml).
+Apache httpd (mod_proxy)
+apache
+
+<VirtualHost *:443>
+  ServerName jenkins.example.com
+  SSLEngine on
+  SSLCertificateFile    /etc/pki/tls/certs/jenkins.crt
+  SSLCertificateKeyFile /etc/pki/tls/private/jenkins.key
+
+  ProxyRequests     Off
+  ProxyPreserveHost On
+  AllowEncodedSlashes NoDecode
+  RequestHeader set X-Forwarded-Proto "https"
+
+  ProxyPass        /  http://127.0.0.1:8080/ nocanon
+  ProxyPassReverse /  http://127.0.0.1:8080/
+</VirtualHost>
+
+Agent port through proxy
+
+JNLP agents need TCP 50000 direct (not HTTP). Open firewall:
+bash
+
+# firewalld
+sudo firewall-cmd --add-port=50000/tcp --permanent && sudo firewall-cmd --reload
+# ufw
+sudo ufw allow 50000/tcp
+
+Or use WebSocket agents through the same 443 (set agent URL wss://jenkins.example.com/ and enable "WebSocket" launcher).
+11. SELinux / Firewall (RHEL family)
+bash
+
+# SELinux
+getenforce
+sudo setsebool -P httpd_can_network_connect 1   # if proxying
+sudo semanage port -a -t http_port_t -p tcp 8080
+sudo semanage port -a -t http_port_t -p tcp 50000
+sudo ausearch -m avc -ts recent                  # inspect denials
+
+# firewalld
+sudo firewall-cmd --permanent --add-port=8080/tcp
+sudo firewall-cmd --permanent --add-port=50000/tcp
+sudo firewall-cmd --reload
+
+12. Service Management & Operations
+Task	Command
+Status	systemctl status jenkins --no-pager
+Start / stop / restart	systemctl start|stop|restart jenkins
+Enable on boot	systemctl enable jenkins
+Logs (systemd)	journalctl -u jenkins -f
+Logs (file)	tail -F /var/log/jenkins/jenkins.log
+Reload config (no JVM restart)	curl -u admin:TOKEN -X POST http://localhost:8080/reload
+Safe restart (drain builds)	curl -u admin:TOKEN -X POST http://localhost:8080/safeRestart
+Quiet down	curl -u admin:TOKEN -X POST http://localhost:8080/quietDown
+Backup	tar czf jenkins-backup-$(date +%F).tgz -C /var/lib jenkins/ (or ThinBackup plugin)
+Verify startup	curl -fsS http://localhost:8080/login >/dev/null && echo OK
+JDK check before upgrade
+bash
+
+java -version
+# LTS 2.479+: must be 17 or 21; 2.463 and earlier: 11 or 17
+
+13. Verification & Health Checks
+bash
+
+# 1. Service up
+systemctl is-active jenkins
+
+# 2. HTTP responds
+curl -fsS -o /dev/null -w '%{http_code}\n' http://localhost:8080/login
+# → 200
+
+# 3. JNLP agent port
+ss -ltnp | grep -E ':(8080|50000)\b'
+
+# 4. REST sanity (after admin token)
+curl -sS -u admin:$API_TOKEN http://localhost:8080/api/json?tree=jobs[name,color]
+
+# 5. Crumb issuer (CSRF)
+curl -sS -u admin:$API_TOKEN http://localhost:8080/crumbIssuer/api/json
+
+# 6. Version
+curl -sS http://localhost:8080/api/json?tree=version   # requires auth
+sudo cat /var/lib/jenkins/config.xml | grep -m1 version
+
+# 7. Plugins loaded
+ls /var/lib/jenkins/plugins | wc -l
+curl -sS -u admin:$API_TOKEN http://localhost:8080/pluginManager/api/json?tree=plugins[shortName,version,enabled]
+
+Smoke-test a job
+bash
+
+curl -u admin:$API_TOKEN -X POST http://localhost:8080/createItem?name=smoke \
+  --data-binary @- -H 'Content-Type: application/xml' <<'EOF'
+<project><builders><hudson.tasks.Shell><command>echo ok</command></hudson.tasks.Shell></builders></project>
+EOF
+curl -u admin:$API_TOKEN -X POST http://localhost:8080/job/smoke/build
+sleep 5
+curl -sS -u admin:$API_TOKEN http://localhost:8080/job/smoke/lastBuild/consoleText
+
+14. Troubleshooting Quick Reference
+Symptom	Cause	Fix
+Jenkins requires Java 17 or newer	Wrong JDK	update-alternatives --config java or install java-17-openjdk-headless
+Port 8080 in use	Conflict	ss -ltnp | grep 8080; change --httpPort
+Web UI: Reverse proxy setup is broken	jenkinsUrl wrong	Set correct Jenkins URL (Manage → System)
+Agents can't connect	Port 50000 blocked	Open firewall; or enable WebSocket launcher
+Permission denied on $JENKINS_HOME	Ownership	chown -R jenkins:jenkins /var/lib/jenkins
+SELinux denials on port 8080	http_port_t	semanage port -a -t http_port_t -p tcp 8080
+Plugin install fails offline	Update Center unreachable	Point hudson.model.UpdateCenter.xml to local mirror; or drop .hpi into $JENKINS_HOME/plugins and restart
+secret.key mismatch after restore	Restored credentials.xml without secret.key	Restore both; or re-enter all credentials
+OOM / OutOfMemoryError	Heap too small	Raise -Xmx (keep ≤ 50–70% of RAM)
+Slow startup	$JENKINS_HOME/war re-explode	Use --webroot=/var/cache/jenkins/war and pin
+Docker: permission denied on volume	UID/GID mismatch	docker run --user 1000:1000 or fix volume ownership
+java.lang.NoClassDefFoundError after upgrade	Plugin incompatibility	Roll back plugin; check pluginManager/api/json
+Collect diagnostics
+bash
+
+systemctl status jenkins
+journalctl -u jenkins --since "1 hour ago" > /tmp/jenkins.log
+ls -la /var/lib/jenkins/
+sudo -u jenkins java -jar /opt/jenkins/jenkins.war --version
+# support bundle (if plugin installed): Manage → Support Core
+
+15. Reference Table — Files, Ports, Paths
+Item	Debian/Ubuntu	RHEL family	Docker
+JENKINS_HOME	/var/lib/jenkins	/var/lib/jenkins	/var/jenkins_home
+Env file	/etc/default/jenkins	/etc/sysconfig/jenkins (legacy)	-e / compose environment:
+systemd unit	/usr/lib/systemd/system/jenkins.service	same	n/a
+WAR	/usr/share/jenkins/jenkins.war	/usr/lib/jenkins/jenkins.war	/usr/share/jenkins/jenkins.war
+Exploded WAR	/var/cache/jenkins/war	/var/cache/jenkins/war	/var/cache/jenkins/war
+Log	/var/log/jenkins/jenkins.log	/var/log/jenkins/jenkins.log	docker logs jenkins
+Initial password	$JENKINS_HOME/secrets/initialAdminPassword	same	docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+Plugs	$JENKINS_HOME/plugins/*.jpi	same	/var/jenkins_home/plugins
+JCasC	$JENKINS_HOME/jenkins.yaml or CASC_JENKINS_CONFIG	same	same
+HTTP port	8080	8080	8080 (published)
+Agent port	50000	50000	50000 (published)
+Web UI	http://host:8080/	same	same
+Reload	POST /reload	same	same
+16. One-Screen Operational Checklist
+text
+
+[ ] OS + time synced (chronyd)
+[ ] Java 17/21 installed and default
+[ ] Dedicated 'jenkins' user, no shell login needed
+[ ] JENKINS_HOME on a dedicated, large, POSIX FS (not NFS)
+[ ] Install method chosen (apt/dnf/docker/k8s/war) + version PINNED
+[ ] Offline: deps + plugins + update-center mirrored & checksum-verified
+[ ] systemd unit hardened (UMask=0027, PrivateTmp, NoNewPrivileges)
+[ ] Firewall: 8080 (or 443 via proxy) + 50000 opened
+[ ] SELinux booleans/ports set (RHEL)
+[ ] Reverse proxy + TLS + correct Jenkins URL
+[ ] Admin password rotated from initialAdminPassword
+[ ] API token issued for automation; stored in secret manager
+[ ] JCasC baseline applied (securityRealm, authorization, clouds)
+[ ] Setup wizard disabled for pre-seeded installs
+[ ] Backup job scheduled (or ThinBackup); restore tested
+[ ] Logs shipped to SIEM; alerting on service/healthcheck
+[ ] Version upgrade path tested (Java compat, plugin compat)
+
+This sheet is self-contained: each install method (online/offline) maps to concrete commands, config paths, ports, verification steps, and the operational knobs you'll actually touch in production.

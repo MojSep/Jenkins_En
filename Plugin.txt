@@ -1,0 +1,577 @@
+﻿Jenkins Plugins for DevOps — Selection, Offline Installation & Production Operations
+
+    Audience: DevOps/SRE engineers running Jenkins in production (online or air-gapped). Versions referenced are current as of Jenkins LTS 2.479+ (Java 17/21).
+
+Part 1 — The High-Value Plugin Set (curated, by category)
+
+    Rule of thumb: every plugin is attack surface and upgrade liability. Install only what a pipeline actually needs. The list below is the set that consistently earns its keep in real DevOps environments — organized by what it does for you, not by popularity.
+
+1.1 Pipeline core (mandatory — installed by "suggested plugins")
+Plugin	ID	Why it matters
+Pipeline (aggregator)	workflow-aggregator	Pulls in workflow-job, workflow-cps, workflow-durable-task-step, workflow-scm-step, workflow-support, workflow-basic-steps, pipeline-stage-step, etc. — the base of everything
+Pipeline: Stage View	pipeline-stage-view	Per-stage visualization, timing, restart-from-stage
+Pipeline Utility Steps	pipeline-utility-steps	readJSON, writeJSON, readYaml, writeYaml, zip, unzip, findFiles, sha1, touch — you will use these in every non-trivial pipeline
+Pipeline: Declarative	(bundled in workflow-aggregator)	pipeline { … } syntax
+Pipeline Graph Analysis	pipeline-graph-analysis	Parallel-stage graph, blue-ocean dependency
+Pipeline: GitHub Groovy Libraries	pipeline-github-lib	@Library from GitHub without configuring
+Pipeline: Build Step	pipeline-build-step	build job: 'x' — cross-job orchestration
+1.2 SCM / Git
+Plugin	ID	Notes
+Git	git	Baseline; provides checkout scm, Git client, shallow clone
+Git client	git-client	Dependency of git
+GitHub Branch Source	github-branch-source	Multibranch + PR discovery, org folders
+GitHub	github	Webhooks, status checks, PR comments
+GitLab	gitlab-plugin	Webhook triggers, MR pipelines, commit status
+Bitbucket Branch Source	bitbucket-branch-source	Cloud + Server
+SSH Agent	ssh-agent	sshagent(['cred-id']) { sh 'git push' } — never put SSH keys on disk
+Git Parameter	git-parameter	Branch/tag/commit as build parameter
+Credentials Binding	credentials-binding	withCredentials([…]) — pair with ssh-agent
+1.3 Configuration as Code & Job management
+Plugin	ID	Notes
+Configuration as Code (JCasC)	configuration-as-code	Non-negotiable in prod. jenkins.yaml in git = reproducible controller
+Job DSL	job-dsl	Generate jobs from Groovy DSL; still valuable for legacy matrix
+Job Configuration History	job-config-history	Track who changed what in config.xml
+Job Import	job-import-plugin	Migrate jobs across instances
+Folders	cloudbees-folder	Namespacing + per-folder RBAC
+Authorize Project	authorize-project	Run builds with a specific identity — critical for audit
+1.4 Credentials, identity, security
+Plugin	ID	Notes
+Credentials	credentials	Base store
+Credentials Binding	credentials-binding	withCredentials
+Role-based Authorization Strategy	role-strategy	Global/folder/job RBAC — the prod authz model
+Matrix Authorization Strategy	matrix-auth	Fine-grained per-item permissions
+LDAP	ldap	Most enterprises
+Active Directory	active-directory	Windows AD shops
+OIC Auth	oic-auth	OIDC / Keycloak / Okta / Azure AD
+SAML	saml	Enterprise SSO
+HashiCorp Vault	hashicorp-vault-plugin	AppRole/K8s auth, dynamic secrets — far better than static creds
+Kubernetes Credentials Provider	kubernetes-credentials-provider	Pull secrets from K8s Secret objects
+Audit Trail	audit-trail	Log config changes + who did them
+Script Security	script-security	Groovy sandbox + script approval — do not remove
+OWASP Markup Formatter	antisamy-markup-formatter	XSS-safe HTML in descriptions
+1.5 Containers / Kubernetes
+Plugin	ID	Notes
+Kubernetes	kubernetes	The dynamic agent provisioner. Pod templates per pipeline
+Kubernetes CLI	kubernetes-cli	withKubeConfig in pipelines
+Kubernetes Credentials	kubernetes-credentials	Typed credential binding
+Docker Pipeline	docker-workflow	docker.build, docker.image().inside {}, docker.withRegistry
+Docker Commons	docker-commons	Shared Docker API layer
+Docker Plugin	docker-plugin	Docker as agent provider (legacy but still used)
+CloudBees Docker Build and Publish	docker-build-publish	Alternative to docker-workflow in freestyle
+Helm	helm	Helm packaging (K8s)
+Kubernetes Client API	(dep)	—
+1.6 Build tools / languages
+Plugin	ID	Notes
+NodeJS	nodejs	Install/use per-version Node in pipelines
+Maven Integration	maven-plugin	mvn in pipeline; usually tool + sh is enough — install only if you use Maven jobs
+Gradle	gradle	Same logic
+Ant	ant	Legacy
+Go	golang	Per-version Go toolchains
+Python	(pyenv plugin or sh + tool)	Prefer tool descriptors
+Pipeline: Shared Groovy Libraries	workflow-cps-global-lib	@Library('my-lib') — centralize pipeline logic
+1.7 Quality gates & testing
+Plugin	ID	Notes
+JUnit	junit	Parse & publish test results
+Warnings Next Generation	warnings-ng	Unified static-analysis reporting (Checkstyle, PMD, ESLint, hadolint, etc.) — replaces dozens of legacy plugins
+Coverage	coverage	Unified coverage (JaCoCo, Cobertura, LCOV)
+JaCoCo	jacoco	Java coverage
+Cobertura	cobertura	Legacy — migrate to coverage
+SonarQube Scanner	sonar	withSonarQubeEnv, waitForQualityGate
+HTML Publisher	htmlpublisher	HTML reports (need CSP relaxation — see ops notes)
+Cucumber Reports	cucumber-reports	BDD reports
+Performance	performance	JMeter/Taurus reports
+1.8 Artifacts & registries
+Plugin	ID	Notes
+Nexus Artifact Uploader	nexus-artifact-uploader	Push to Nexus
+Artifactory	artifactory	JFrog native
+S3 Publisher	s3	Upload to S3
+Publish Over SSH	publish-over-ssh	SCP/SFTP — avoid, prefer sshagent + rsync
+Copy Artifact	copyartifact	Cross-job artifact sharing (prefer stash/unstash in same pipeline)
+1.9 Notifications & integrations
+Plugin	ID	Notes
+Slack	slack	slackSend — standard team notification
+Email Extension	email-ext	Templated HTML email with attachments
+Mattermost	mattermost	Self-hosted Slack alternative
+Microsoft Teams	office-365-connector	Teams webhooks
+Discord	discord-notifier	If used
+1.10 Reliability & operations
+Plugin	ID	Notes
+Timestamper	timestamper	Timestamps on every console line — always install
+Build Timeout	build-timeout	Abort hung builds
+Rebuild	rebuild	Re-run with same params
+Workspace Cleanup	ws-cleanup	cleanWs() — prevents disk blow-up
+Disk Usage	disk-usage	Per-job disk report
+ThinBackup	thin-backup	Incremental $JENKINS_HOME backup (or use tar + cron)
+Monitoring	monitoring	/monitoring endpoint: JVM, heap, threads — Prometheus-friendly
+Prometheus Metrics	prometheus	/prometheus scrape endpoint — best for observability
+Build Discarder (core)	—	Always configure per-job: keep N builds
+Quiet Down	(core)	Drains builds before restart
+Locale	locale	Force UI language
+Dark Theme	dark-theme	Cosmetic but loved
+1.11 Deployment / GitOps
+Plugin	ID	Notes
+Terraform	terraform	terraform { … } wrapper, plan/apply
+Ansible	ansible	ansiblePlaybook / ansibleAdhoc
+Argo CD	argocd	Trigger Argo sync from pipeline
+Generic Webhook Trigger	generic-webhook-trigger	Any webhook → Jenkins build, zero custom code
+Parameterized Trigger	parameterized-trigger	Trigger downstream with params
+Extended Choice Parameter	extended-choice-parameter	Rich dropdowns/checkboxes
+Active Choices	uno-choice	Reactive parameters
+Multibranch Scan Webhook Trigger	multibranch-scan-webhook-trigger	Push → auto-scan multibranch
+1.12 Minimal recommended baseline (minimum viable secure set)
+
+If you can only justify ~25 plugins in prod:
+text
+
+workflow-aggregator
+pipeline-stage-view
+pipeline-utility-steps
+git
+github-branch-source        # or gitlab-plugin / bitbucket-branch-source
+ssh-agent
+credentials
+credentials-binding
+configuration-as-code
+role-strategy
+ldap                        # or oic-auth / saml
+script-security
+matrix-auth
+kubernetes                  # or docker-workflow if no k8s
+docker-workflow
+junit
+warnings-ng
+coverage
+sonar
+slack                       # or email-ext
+timestamper
+build-timeout
+ws-cleanup
+thin-backup                 # or prometheus + external backup
+monitoring                  # or prometheus
+
+Everything else is opt-in per team/use case.
+Part 2 — Offline Plugin Installation (air-gapped / no internet)
+2.1 The dependency graph problem
+
+Jenkins plugins are .hpi (a .jar-like zip) with META-INF/MANIFEST.MF declaring:
+
+    Plugin-Version
+
+    Jenkins-Version (minimum core — must be ≤ your core)
+
+    Plugin-Dependencies (list of id:version — must be installed or Jenkins refuses to load)
+
+Never copy random .hpi files by hand — you'll miss transitive dependencies. Always use the official plugin-installation-manager-tool, which resolves the full graph against the update center.
+2.2 Method A — jenkins-plugin-manager (recommended)
+On an online staging host (same arch is irrelevant — pure Java):
+bash
+
+# 1. Download the tool (pin a version)
+curl -fsSL -o jenkins-plugin-manager.jar \
+  https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/2.13.2/jenkins-plugin-manager.jar
+
+# 2. Download the target core WAR (exact version you'll deploy)
+VER=2.479.1
+curl -fsSLO "https://get.jenkins.io/war-stable/${VER}/jenkins.war"
+sha256sum jenkins.war   # record this — you'll verify on target
+
+# 3. Declare plugins (one per line; optional :version pin)
+cat > plugins.txt <<'EOF'
+configuration-as-code:1921.vd6b_89e0e6c3
+kubernetes:4287.v98a_8f9b_2a_1d
+workflow-aggregator:600.vb_57cdd26fdd7
+pipeline-stage-view:2.36
+pipeline-utility-steps:2.18.0
+git:5.7.0
+github-branch-source:1802.v28d80e864d1f
+gitlab-plugin:1.9.3
+ssh-agent:368.vd8806d71b_6d8
+credentials-binding:687.v619cb_15e923f
+role-strategy:756.v891d88f2cd46
+ldap:768.v29a_b_6a_c7c4d0
+hashicorp-vault-plugin:371.v884a_4dd60fb_6
+docker-workflow:594.v9247a_98518c4
+junit:1319.v7eb_51b_3a_c97b_
+warnings-ng:11.1.0
+coverage:1929.v5d5a_8d9c5a_4f
+sonar:2.17.2
+slack:703.v59d6b_7a_6e2b_5
+timestamper:1.28
+build-timeout:1.33
+ws-cleanup:0.47
+thin-backup:1.3.0
+monitoring:1.97.0
+prometheus:793.vb_1e4e6a_8f5c1
+EOF
+
+# 4. Resolve + download
+mkdir -p plugins
+java -jar jenkins-plugin-manager.jar \
+  --war ./jenkins.war \
+  --plugin-file plugins.txt \
+  --plugin-download-directory ./plugins \
+  --latest false \
+  --clean-target-dir \
+  --verbose
+
+# 5. Checksum + bundle
+sha256sum plugins/*.hpi plugins/*.jpi > plugins/SHA256SUMS
+tar czf jenkins-offline-${VER}-$(date +%F).tgz \
+  jenkins.war plugins/ plugins/SHA256SUMS
+
+Notes:
+
+    --latest false — honor the pins in plugins.txt (default is latest; in prod you want reproducible versions).
+
+    --clean-target-dir — removes stale .jpi files first; safe on a fresh build dir.
+
+    If a pinned version's deps aren't themselves pinned, the tool picks the newest compatible — commit the resolved list (plugins/*.hpi filenames + plugins.txt) to git for reproducibility.
+
+    The output mixes .hpi (original) and .jpi (renamed) — both are fine; Jenkins loads both.
+
+On the air-gapped target:
+bash
+
+# 1. Transfer bundle via USB/jump host, verify checksums
+sha256sum -c plugins/SHA256SUMS
+
+# 2. Install WAR
+sudo cp jenkins.war /opt/jenkins/jenkins.war
+sudo chown jenkins:jenkins /opt/jenkins/jenkins.war
+
+# 3. Drop plugins into JENKINS_HOME/plugins BEFORE first start
+sudo mkdir -p /var/lib/jenkins/plugins
+sudo cp -v plugins/*.hpi plugins/*.jpi /var/lib/jenkins/plugins/ 2>/dev/null
+sudo chown -R jenkins:jenkins /var/lib/jenkins
+
+# 4. Point Update Center at a local mirror OR disable it
+sudo -u jenkins tee /var/lib/jenkins/hudson.model.UpdateCenter.xml >/dev/null <<'EOF'
+<?xml version='1.1' encoding='UTF-8'?>
+<sites>
+  <site>
+    <id>default</id>
+    <url>file:/opt/jenkins/updates/update-center.json</url>
+  </site>
+</sites>
+EOF
+# (A missing/corrupt update-center.json simply means "no plugin updates available" —
+#  it will NOT block startup. But you will see a banner; see §2.4 for a clean mirror.)
+
+# 5. Start
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins
+sudo journalctl -u jenkins -f
+
+2.3 Method B — Pre-baked Docker image (recommended for container fleets)
+dockerfile
+
+# Dockerfile
+FROM jenkins/jenkins:2.479.1-lts-jdk17
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt \
+    --latest false --clean-target-dir
+# plugin-cli is bundled in the image; equivalent to the manager tool
+
+Build on staging, ship the tarball:
+bash
+
+docker build -t jenkins-custom:2.479.1-1 .
+docker save jenkins-custom:2.479.1-1 | gzip > jenkins-custom-2.479.1-1.tgz
+
+# on target
+gunzip -c jenkins-custom-2.479.1-1.tgz | docker load
+docker run -d --name jenkins \
+  -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home \
+  jenkins-custom:2.479.1-1
+
+/usr/share/jenkins/ref/plugins.txt is auto-installed on first boot if $JENKINS_HOME/plugins is empty — so don't pre-populate the volume if you want the image to seed plugins.
+2.4 Method C — Local update-center mirror (for many controllers)
+
+Best when you have 3+ controllers or frequent plugin updates. Mirrors the metadata + binaries.
+On an online host:
+bash
+
+# 1. Get the current update-center.json
+curl -fsSL -o update-center.json https://updates.jenkins.io/update-center.json
+
+# 2. Mirror all referenced plugin binaries (or only the ones you allow)
+#    The "url" field in update-center.json points at updates.jenkins.io/download/plugins/...
+#    Rewrite to your internal HTTP server, and rsync the .hpi files.
+
+mkdir -p /var/www/html/jenkins-mirror/plugins
+python3 - <<'PY'
+import json, urllib.request, os, re
+uc = json.load(open("update-center.json"))
+base = "/var/www/html/jenkins-mirror"
+for name, p in uc["plugins"].items():
+    url = p.get("url")
+    if not url: continue
+    # pick the versioned hpi url (not the generic "latest" one)
+    version = p["version"]
+    fname = f"{name}.hpi"
+    dst = f"{base}/plugins/{fname}"
+    if os.path.exists(dst): continue
+    try:
+        urllib.request.urlretrieve(url, dst)
+        print("ok", name, version)
+    except Exception as e:
+        print("fail", name, e)
+    # rewrite the url in the JSON
+    p["url"] = f"http://repo.internal/jenkins-mirror/plugins/{fname}"
+json.dump(uc, open(f"{base}/update-center.json","w"))
+PY
+
+Serve /var/www/html/jenkins-mirror/ via nginx/httpd on http://repo.internal/jenkins-mirror/.
+On each target:
+xml
+
+<!-- $JENKINS_HOME/hudson.model.UpdateCenter.xml -->
+<?xml version='1.1' encoding='UTF-8'?>
+<sites>
+  <site>
+    <id>default</id>
+    <url>http://repo.internal/jenkins-mirror/update-center.json</url>
+  </site>
+</sites>
+
+Restart Jenkins → Manage → Plugins now shows the mirrored update center.
+
+Caveats:
+
+    The mirror must be inside your trust boundary — a compromised update-center is RCE.
+
+    Jenkins accepts unsigned JSON only if the URL is http:// on localhost or the site is marked -Dhudson.model.UpdateCenter.skipPermissionCheck=true — otherwise sign it with update-center2 tooling, or terminate TLS on your mirror with a CA-signed cert.
+
+    updates/default.json in $JENKINS_HOME caches the last fetch; delete it to force re-read after changing the URL.
+
+2.5 Method D — Manual .hpi drop (last resort, small sets)
+bash
+
+# 1. On staging: get the hpi + ALL deps (use the manager tool to identify deps)
+java -jar jenkins-plugin-manager.jar --list --plugin-file plugins.txt --war jenkins.war
+
+# 2. Copy .hpi files to target
+sudo cp *.hpi /var/lib/jenkins/plugins/
+sudo chown jenkins:jenkins /var/lib/jenkins/plugins/*.hpi
+
+# 3. Restart (plugins load only at startup)
+sudo systemctl restart jenkins
+
+# 4. Verify — check for missing-dependency errors
+sudo grep -iE 'failed|missing|unsatisfied' /var/log/jenkins/jenkins.log
+
+If Jenkins refuses to load a plugin, the log will say exactly which dependency+version is missing — feed that back into plugins.txt and re-resolve.
+2.6 Verification & integrity
+bash
+
+# 1. Per-file checksum
+sha256sum -c plugins/SHA256SUMS
+
+# 2. Plugin GPG signature (Jenkins signs .hpi files)
+#    Get the key once:  https://www.jenkins.io/download/  → "GPG key"
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
+  | gpg --dearmor -o /usr/share/keyrings/jenkins.gpg
+for f in plugins/*.hpi; do
+  gpg --verify <(unzip -p "$f" META-INF/*.SF) ... # see update-center for exact sig file
+done
+# Practical: rely on the plugin-manager tool + sha256 manifest; verify GPG at mirror-build time.
+
+# 3. Core/plugin compatibility at startup
+sudo grep -E 'Plugin .* requires Jenkins|depends on .* but' /var/log/jenkins/jenkins.log
+
+2.7 Updating plugins offline (the repeatable loop)
+bash
+
+# staging (online)
+git pull                                  # updated plugins.txt
+java -jar jenkins-plugin-manager.jar \
+  --war jenkins.war --plugin-file plugins.txt \
+  --plugin-download-directory ./plugins-new \
+  --latest false --clean-target-dir
+diff <(ls plugins) <(ls plugins-new)       # what changed
+
+# target (offline)
+# 1. backup
+sudo tar czf /var/backups/jenkins-pre-update-$(date +%F).tgz -C /var/lib jenkins/
+# 2. stop, swap, start
+sudo systemctl stop jenkins
+sudo rm -rf /var/lib/jenkins/plugins/*
+sudo cp plugins-new/*.hpi /var/lib/jenkins/plugins/
+sudo chown -R jenkins:jenkins /var/lib/jenkins/plugins
+sudo systemctl start jenkins
+# 3. verify
+sudo grep -iE 'failed|unsatisfied' /var/log/jenkins/jenkins.log || echo OK
+
+Part 3 — Production Operations for Jenkins Plugins
+3.1 Version discipline (the #1 cause of production incidents)
+Practice	Why
+Pin every plugin in plugins.txt / Dockerfile / JCasC; commit to git	Reproducible builds; no surprise breakage on restart
+Pin core (WAR) and only upgrade in a maintenance window	Plugins declare Jenkins-Version; a core upgrade can break pinned plugins
+Never use :latest in plugins.txt or image tags	--latest true silently upgrades mid-clean build → different runtime
+Track the compatibility matrix	pluginManager/api/json?tree=plugins[shortName,version,dependencies[shortName,version]]; upgrade core + plugins as a coordinated set
+Stage first	A staging controller with the same plugins.txt + a copy of prod $JENKINS_HOME (secrets scrubbed) is the only safe pre-prod test
+One plugin per commit in plugins.txt	Bisectable rollback
+3.2 Upgrade strategy (safe window)
+bash
+
+# 1. Pre-flight on staging with prod copy
+# 2. Read changelogs for breaking changes + security advisories
+#    https://www.jenkins.io/security/advisories/
+# 3. Quiet down prod
+curl -u admin:$TOKEN -X POST https://jenkins.example.com/quietDown
+# 4. Wait until no running builds
+while curl -sS -u admin:$TOKEN https://jenkins.example.com/queue/api/json | grep -q '"items":\[.'; do sleep 10; done
+# 5. Backup
+tar czf /var/backups/jenkins-$(date +%F_%H%M).tgz -C /var/lib jenkins/
+# 6. Swap plugins + WAR (offline path) OR use the UI update for small online upgrades
+# 7. Restart, verify, un-quiet
+curl -u admin:$TOKEN -X POST https://jenkins.example.com/cancelQuietDown
+
+Never click "Update all" in Manage → Plugins on a live prod controller — it triggers a restart and can leave you with a partially upgraded set if the restart is interrupted. Batch updates: 1–3 plugins per window, verify, repeat.
+3.3 Security operations
+Control	Implementation
+Track CVEs	Subscribe to https://www.jenkins.io/security/advisories/ ; use pluginManager/api/json + Dependabot/Renovate on plugins.txt
+Least-privilege authz	role-strategy (global + folder roles). Agents: no Overall/Administer. Controller: no builds (numExecutors: 0)
+Script Security	Keep enabled. Every unapproved Groovy method call is a potential RCE. Review scriptApproval in $JENKINS_HOME/scriptApproval.xml. Ban signatures aggressively.
+Disable unused plugins	Every enabled plugin = attack surface + JVM memory. pluginManager/api/json?tree=plugins[shortName,enabled] → disable then uninstall
+Plugin provenance	Only install from the official update center / your signed mirror. Never install a .hpi from a random Slack/email.
+CSRF	Keep on (/manage/configureSecurity/). Use crumbIssuer for API calls.
+Agent → controller	Set agent → controller access control to "Agent → Controller Access Control" (not "Anyone") in /manage/configureSecurity/ — otherwise a compromised agent can read $JENKINS_HOME
+Secrets	Never put secrets in credentials if you have Vault/External Secrets — use hashicorp-vault-plugin or kubernetes-credentials-provider
+CSP / HTML Publisher	htmlpublisher and script-security need Content-Security-Policy relaxation for inline HTML — do it per-job via -Dhudson.model.DirectoryBrowserSupport.CSP=... and not globally disable CSP
+Audit	audit-trail plugin + ship jenkins.log to SIEM. Alert on scriptApproval additions and credentials reads
+TLS everywhere	Reverse proxy terminates TLS; controller listens on 127.0.0.1:8080 only
+3.4 Memory, startup time, and plugin explosion
+
+    Each plugin consumes JVM heap + classes at startup. 150+ plugins is normal; 300+ gets painful. Watch:
+    bash
+
+    curl -sS -u admin:$TOKEN http://localhost:8080/monitoring?format=json   # monitoring plugin
+    curl -sS http://localhost:8080/prometheus                              # prometheus plugin
+
+    Startup time scales with plugin count × disk. -Djenkins.model.Jenkins.logStartupPerformance=true gives a per-phase breakdown.
+
+    Metaspace leaks on redeploy — -XX:MaxMetaspaceSize=1g + -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/jenkins/.
+
+    Heap sizing: -Xms = -Xmx = 50–70% of container/host RAM; leave room for OS + agents if colocated.
+
+    $JENKINS_HOME/war re-explode: use --webroot=/var/cache/jenkins/war and pin it — otherwise every restart re-explodes and slows boot.
+
+3.5 Dependency and conflict troubleshooting
+
+Symptom → action:
+Log line / UI	Meaning	Fix
+Plugin X depends on Y but Y is not installed	Missing dep	Re-resolve with manager tool; add to plugins.txt
+Plugin X requires Jenkins 2.xxx or higher	Core too old	Upgrade core first, then plugin
+Plugin X failed to load: ClassNotFoundException	Version skew	Pin exact versions; check dependencies tree
+Plugin X is deprecated	Upstream deprecation	Migrate to successor (e.g. cobertura → coverage, publish-over-ssh → sshagent+rsync)
+Plugin loads but pipeline step "not found"	Plugin disabled or load failed	Check /pluginManager/installed/; restart
+hudson.util.IOException2: … checksum mismatch	Corrupt .hpi	Re-download + verify sha256/GPG
+Jenkins won't start after upgrade	Plugin/core incompat	Roll back $JENKINS_HOME/plugins + WAR from backup; bisect
+
+Debug commands:
+bash
+
+# Which plugins are enabled/disabled + versions
+curl -sS -u admin:$TOKEN http://localhost:8080/pluginManager/api/json?pretty=1 \
+  | jq '.plugins[] | select(.enabled==true) | {shortName,version}'
+
+# Dependency tree for a plugin
+curl -sS -u admin:$TOKEN "http://localhost:8080/pluginManager/api/json?tree=plugins[shortName,version,dependencies[shortName,version]]" \
+  | jq '.'
+
+# Startup failures
+sudo grep -iE 'failed to load|UnsatisfiedDependency|ClassNotFound' /var/log/jenkins/jenkins.log
+
+# Plugin count / disk
+ls /var/lib/jenkins/plugins | wc -l
+du -sh /var/lib/jenkins/plugins
+
+3.6 JCasC vs plugin config drift
+
+    JCasC only manages plugins that expose a @Symbol / descriptor for JCasC. Not all do.
+
+    Rule: manage security realm, authorization, clouds, credentials, tools, and global config via JCasC. Manage plugin-specific job config via Jenkinsfile / Job DSL. Keep a plugins.txt + jenkins.yaml pair in git as the source of truth.
+
+    After upgrading a plugin, re-validate JCasC reload:
+    bash
+
+    curl -u admin:$TOKEN -X POST https://jenkins.example.com/configuration-as-code/reload
+    # → 200 = ok; non-200 = check $JENKINS_HOME/jenkins.yaml + plugin schema changes
+
+3.7 Backup & disaster recovery for plugins
+
+    Back up $JENKINS_HOME/plugins/ + plugins.txt + jenkins.yaml + credentials.xml + secret.key together — a partial restore leaves you with plugins that can't decrypt credentials.
+
+    Test restore quarterly into a staging controller:
+    bash
+
+    tar xzf jenkins-backup.tgz -C /tmp/restore
+    # start a throwaway controller with JENKINS_HOME=/tmp/restore/jenkins
+
+    ThinBackup can miss plugins/ if configured wrong — verify the include list.
+
+3.8 Observability
+Signal	How
+Plugin inventory drift	Export pluginManager/api/json to Prometheus/Grafana nightly; alert on diff vs git
+JVM / heap / GC	prometheus plugin /prometheus + node_exporter
+Build queue / executors	/queue/api/json, /computer/api/json, monitoring plugin
+Failure rate	Parse builds/*/build.xml <result> or use prometheus plugin's build metrics
+Security events	audit-trail plugin → syslog → SIEM
+3.9 Anti-patterns to avoid
+
+    --latest true in prod. Non-reproducible; a plugin's new release can break you on next rebuild.
+
+    Editing plugins/ by hand while Jenkins is running. Jenkins holds file handles; swaps are only safe while stopped (or via the update UI which handles it).
+
+    Auto-update plugins on a controller that also builds jobs. Always update on a controller with numExecutors: 0 and a staging copy.
+
+    Installing plugins without reading the changelog. Breaking changes (e.g. kubernetes pod template schema, role-strategy permission model) land as minor versions.
+
+    Granting Overall/Administer broadly. Plugin admin endpoints (/pluginManager, /script, /reload) are RCE-adjacent.
+
+    Ignoring Jenkins-Version. New plugin versions routinely raise the minimum core; upgrading one forces a core upgrade.
+
+    Leaving disabled-but-installed plugins in $JENKINS_HOME/plugins/. They still consume classpath and can be re-enabled by a compromised account — uninstall what you don't use.
+
+    Trusting a local update-center over plain HTTP from an untrusted network. That JSON can redirect plugin downloads to arbitrary URLs → RCE. TLS + signed mirror only.
+
+    Skipping the script-approval review. Approved Groovy signatures are a permanent sandbox bypass — review before approving, and prune periodically.
+
+    Running agents with controller credentials mounted. With kubernetes plugin, ensure pod templates don't mount the controller's $JENKINS_HOME; use kubernetes-credentials-provider or Vault.
+
+Part 4 — One-Screen Plugin Ops Checklist
+text
+
+[ ] plugins.txt pinned + committed to git (single source of truth)
+[ ] jenkins.war version pinned; plugins declare Jenkins-Version <= core
+[ ] plugins resolved via jenkins-plugin-manager (offline: staged on connected host)
+[ ] sha256 manifest verified on target; mirror (if any) is TLS + trusted
+[ ] No :latest; no manual .hpi drops without dep resolution
+[ ] Backup before every plugin/core change; restore tested
+[ ] Staging controller upgraded first; prod upgraded in window with quietDown
+[ ] Script Security ON; script approval reviewed & pruned
+[ ] role-strategy + least privilege; agents cannot read $JENKINS_HOME
+[ ] Agent→Controller access control enabled (not "Anyone")
+[ ] Unused plugins uninstalled (not just disabled)
+[ ] JCasC + plugins.txt + credentials + secret.key backed up together
+[ ] prometheus/monitoring endpoint scraped; plugin drift alerted
+[ ] audit-trail → SIEM; alerts on script approval + credential access
+[ ] CSP relaxed per-job (htmlpublisher), not globally
+[ ] Upgrade = 1–3 plugins per window, verify, repeat
+
+Part 5 — Quick Reference Table
+Scenario	Command / file
+Resolve + download plugins offline	java -jar jenkins-plugin-manager.jar --war jenkins.war --plugin-file plugins.txt --plugin-download-directory ./plugins --latest false
+Bake into image	RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt --latest false
+Drop into live home	cp *.hpi $JENKINS_HOME/plugins/ && systemctl restart jenkins
+List installed (API)	curl -u admin:TOKEN http://localhost:8080/pluginManager/api/json
+Check dep tree	…?tree=plugins[shortName,version,dependencies[shortName,version]]
+Startup failures	grep -iE 'failed|UnsatisfiedDependency' $JENKINS_HOME/../logs/jenkins.log
+Disable a plugin	UI: Manage → Plugins → uncheck "Enabled", then restart, then uninstall
+Local update center	$JENKINS_HOME/hudson.model.UpdateCenter.xml → file: or http://mirror/…/update-center.json
+JCasC reload after plugin change	curl -u admin:TOKEN -X POST /configuration-as-code/reload
+Metrics	/prometheus (prometheus plugin), /monitoring?format=json (monitoring plugin)
+
+This is the complete operational picture for plugin selection, offline installation, and production-safe management: pin everything, resolve dependencies with the official tool, verify checksums/signatures, upgrade in small batches with backups and staging, keep the attack surface minimal, and observe the controller continuously.

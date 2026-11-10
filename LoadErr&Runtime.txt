@@ -1,0 +1,781 @@
+﻿Jenkins Startup / Load Failures — Production Troubleshooting Guide
+
+    Scope: Jenkins controller (LTS 2.4xx / 2.46x, Java 17/21) running under systemd, Docker, or Kubernetes on Linux. Focus is on why Jenkins fails to load, how to diagnose each class of failure, and how to monitor and control startup in production.
+
+Part 0 — Understand the Startup Lifecycle First
+
+Every Jenkins startup runs these phases in order. The phase where it dies tells you the category of failure.
+text
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ 1. OS / systemd / container entrypoint                              │
+│    - unit exists, User=, Environment=, ExecStart=, Limits           │
+│    - JVM binary present and executable                              │
+├─────────────────────────────────────────────────────────────────────┤
+│ 2. JVM boot                                                         │
+│    - JVM flags valid, heap allocatable, metaspace, no OOM at boot   │
+│    - JDK version satisfies Jenkins requirement                       │
+├─────────────────────────────────────────────────────────────────────┤
+│ 3. WAR / webapp init                                                │
+│    - $JENKINS_HOME readable, writable, POSIX FS                      │
+│    - war/ exploded or --webroot usable                              │
+│    - config.xml parseable (if it exists)                            │
+├─────────────────────────────────────────────────────────────────────┤
+│ 4. Plugin classloading                                              │
+│    - every .hpi/.jpi present, checksum OK, deps satisfied            │
+│    - Plugin-Version vs Jenkins-Version compatibility                │
+│    - No duplicate/conflicting classes                               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 5. Security realm init                                              │
+│    - LDAP/AD/OIDC/SAML reachable; CA trusted; bind creds valid      │
+├─────────────────────────────────────────────────────────────────────┤
+│ 6. Credentials / secret.key decrypt                                 │
+│    - secret.key + credentials.xml coherent; not restored partially  │
+├─────────────────────────────────────────────────────────────────────┤
+│ 7. Job loading (jobs/*/config.xml)                                  │
+│    - XML valid; plugin that defined the job present                 │
+├─────────────────────────────────────────────────────────────────────┤
+│ 8. Node/cloud init                                                  │
+│    - agent ports bound, cloud API reachable, K8s RBAC               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 9. HTTP listener bound → ready                                      │
+│    - /login returns 200; JNLP port (50000) listening                │
+└─────────────────────────────────────────────────────────────────────┘
+
+Production rule: capture the phase before you touch anything. Every diagnosis below starts from "which phase failed".
+Part 1 — Failure Classes, Symptoms, Diagnosis, Fix
+1.1 Service / systemd / container won't start (phase 1)
+Symptoms
+text
+
+● jenkins.service - Jenkins Continuous Integration Server
+     Loaded: loaded (...; enabled; vendor preset: disabled)
+     Active: failed (Result: exit-code) since …
+    Process: 1234 ExecStart=/usr/bin/java ... (code=exited, status=1/FAILURE)
+
+Root causes + fixes
+Cause	Diagnosis	Fix
+Unit file overridden incorrectly	systemctl cat jenkins shows a broken drop-in	systemctl edit --full jenkins; fix ExecStart=, User=, Environment=; systemctl daemon-reload
+JENKINS_HOME doesn't exist / wrong owner	ls -ld /var/lib/jenkins → not jenkins:jenkins	install -d -o jenkins -g jenkins -m 0750 /var/lib/jenkins
+Wrong JAVA_HOME / java not on PATH	systemctl show jenkins | grep -i env; sudo -u jenkins which java	Fix Environment="JAVA_HOME=…" or ExecStart=/usr/bin/java …
+Port already in use	ss -ltnp | grep -E ':(8080|50000)\b'	Kill stray java; or change --httpPort / -Dhudson.TcpSlaveAgentListener.port
+LimitNOFILE too low	journalctl -u jenkins → Too many open files	LimitNOFILE=65536 in unit
+Read-only FS / full disk	df -h, mount | grep ' ro,'	Free space; remount rw
+Docker: wrong UID on volume	docker logs jenkins → Permission denied writing $JENKINS_HOME	--user 1000:1000 or chown -R 1000:1000 /var/jenkins_home
+SELinux denial	ausearch -m avc -ts recent | grep jenkins	semanage fcontext -a -t … / restorecon -Rv /var/lib/jenkins; or setsebool -P appropriately
+Unit disabled after package upgrade	systemctl is-enabled jenkins	systemctl enable jenkins
+ExecStart references a deleted WAR	ls -l /usr/share/jenkins/jenkins.war	Reinstall package or restore WAR; fix ExecStart=
+Diagnostic block
+bash
+
+systemctl status jenkins --no-pager
+systemctl cat jenkins                      # effective unit + drop-ins
+journalctl -u jenkins -b --no-pager -n 200
+systemctl show jenkins | grep -Ei 'execstart|environment|user|umask|limit'
+ss -ltnp | grep -E ':(8080|50000)\b'
+df -h /var/lib/jenkins /var/log
+ls -ld /var/lib/jenkins /var/log/jenkins
+sudo -u jenkins test -w /var/lib/jenkins && echo writable || echo NOT-writable
+getenforce 2>/dev/null; ausearch -m avc -ts recent 2>/dev/null | tail
+
+1.2 JVM refuses to boot / dies at JVM level (phase 2)
+Symptoms
+text
+
+Error occurred during initialization of VM
+Could not reserve enough space for object heap
+Unrecognized VM option 'UseG1GC'    # or similar
+
+or
+text
+
+Exception in thread "main" java.lang.UnsupportedClassVersionError:
+  jenkins.war ... compiled with a newer Java
+
+Root causes + fixes
+Cause	Diagnosis	Fix
+Wrong JDK version	java -version; Jenkins LTS ≥ 2.479 requires Java 17/21	update-alternatives --config java; pin in unit Environment="JAVA_HOME=…"
+Heap larger than container/host RAM	-Xmx > available; free -h, cgroup memory.max	Reduce -Xmx to ≤ 50–70% of limit; or raise cgroup limit
+-Xms = -Xmx too big at boot	OOM at startup, no heap dump	Same fix; consider -Xms smaller
+Obsolete/removed JVM flag	journalctl → Unrecognized VM option	Remove flag; -XX:+UseG1GC is fine on 17/21; -XX:MaxPermSize is dead
+JAVA_OPTS malformed (quotes)	systemctl show jenkins | grep -i java_opts	Fix quoting; prefer Environment="JAVA_OPTS=…" in a drop-in
+Metaspace exhausted at boot	java.lang.OutOfMemoryError: Metaspace	-XX:MaxMetaspaceSize=1g (and HeapDump on OOM)
+cgroup v2 limits ignored (JDK < 10)	container killed silently	Use JDK 17/21 which honors cgroups v2
+-Djava.awt.headless=true missing on server	Startup stalls on fontconfig	Add flag
+Diagnostic block
+bash
+
+java -version 2>&1
+echo "$JAVA_OPTS"
+systemctl show jenkins | grep -i java_opts
+free -h; cat /sys/fs/cgroup/memory.max 2>/dev/null
+journalctl -u jenkins -b | grep -iE 'unrecognized|heap|metaspace|unsupportedclassversion|outofmemory'
+# inspect actual command line
+ps -eo pid,args | grep -i 'jenkins.war' | grep -v grep
+
+Canonical JVM flags for production
+text
+
+-Xms2g -Xmx4g
+-XX:MaxMetaspaceSize=1g
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/jenkins/
+-Djava.awt.headless=true
+-Dhudson.model.DirectoryBrowserSupport.CSP=... (per-job, not global)
+-Djenkins.model.Jenkins.logStartupPerformance=true
+-Dhudson.lifecycle=hudson.lifecycle.ExitLifecycle
+-Duser.timezone=Asia/Tehran
+-Dfile.encoding=UTF-8
+
+1.3 $JENKINS_HOME / filesystem problems (phase 3)
+Symptoms
+text
+
+hudson.util.HudsonFailedToLoad: jenkins.model.InitMilestone ...
+java.io.IOException: Failed to create a temporary file
+java.nio.file.AccessDeniedException: /var/lib/jenkins/…
+
+Root causes + fixes
+Cause	Diagnosis	Fix
+Directory not writable by jenkins	sudo -u jenkins test -w /var/lib/jenkins	chown -R jenkins:jenkins /var/lib/jenkins
+NFS with locking issues	mount | grep /var/lib; startup hangs on config.xml	Move to local POSIX FS — do not run $JENKINS_HOME on NFS/CIFS
+Disk full	df -h /var/lib/jenkins	Clean workspace/, old builds (builds/*), plugins/*.bak, logs; set build discarders
+Inode exhaustion	df -i /var/lib/jenkins	Find dir with millions of files (find … | wc -l) — usually jobs/*/builds/*/archive/
+Corrupt config.xml	Log: Configurator ... Failed to load; XML parser exception	Restore from backup; or move aside and let Jenkins regenerate defaults (loses config)
+hudson.model.UpdateCenter.xml malformed	Startup error mentioning UpdateCenter	Restore valid XML; see offline mirror section
+secret.key missing/zero bytes	hudson.util.HudsonFailedToLoad; credentials.xml undecryptable	Restore both secret.key and credentials.xml from same backup
+war/ exploded to read-only dir	--webroot not writable	--webroot=/var/cache/jenkins/war writable by jenkins
+Diagnostic block
+bash
+
+ls -la /var/lib/jenkins/
+sudo -u jenkins touch /var/lib/jenkins/.write-test && rm /var/lib/jenkins/.write-test && echo OK
+df -h /var/lib/jenkins; df -i /var/lib/jenkins
+mount | grep /var/lib
+python3 - <<'PY'
+import xml.etree.ElementTree as ET, sys
+for f in ["/var/lib/jenkins/config.xml",
+          "/var/lib/jenkins/hudson.model.UpdateCenter.xml",
+          "/var/lib/jenkins/jenkins.model.JenkinsLocationConfiguration.xml"]:
+    try:
+        ET.parse(f); print("OK ", f)
+    except Exception as e:
+        print("BAD", f, e)
+PY
+ls -l /var/lib/jenkins/secret.key /var/lib/jenkins/credentials.xml 2>&1
+journalctl -u jenkins -b | grep -iE 'AccessDenied|IOException|Failed to load|HudsonFailedToLoad'
+
+1.4 Plugin loading failures (phase 4) — the most common production cause
+Symptoms
+text
+
+Failed Loading plugin X: … UnsatisfiedDependencyException
+Plugin X depends on Y but Y is not installed
+Plugin X requires Jenkins 2.xxx or higher
+ClassNotFoundException: …
+
+Jenkins may still serve /login but many jobs, credentials, or security realm may be broken. Or startup hangs and never finishes.
+Root causes + fixes
+Cause	Diagnosis	Fix
+Missing transitive dependency	grep -i 'UnsatisfiedDependency|depends on' jenkins.log	Re-resolve with jenkins-plugin-manager (see previous guide); do not hand-copy .hpi
+Plugin requires newer core	Log line: requires Jenkins 2.xxx or higher	Upgrade core first (in window), then plugin — or pin older plugin
+Core too new for pinned plugin	Plugin disabled/no step found	Keep core pinned; upgrade plugin set with core in one change
+Duplicate/conflicting plugins	ClassNotFoundException or NoSuchMethodError	Remove duplicate .hpi; keep only official IDs
+Corrupt .hpi (truncated download)	checksum mismatch, ZipException	Re-download + verify sha256/GPG; replace file
+Disabled plugin still in plugins/	pluginManager/api/json shows enabled:false	Uninstall (not just disable) to remove classpath
+Partial plugin restore	Some .hpi present, some missing	Restore entire plugins/ dir + plugins.txt from same backup
+script-security disabled / approval store corrupt	scriptApproval.xml XML error	Restore scriptApproval.xml; never disable script-security in prod
+role-strategy / matrix-auth config broken	Startup OK but all users 403 / login loops	Restore authz XML or JCasC; login as emergency admin via config.xml fix
+kubernetes/cloud plugin misconfig	Startup slow / hangs contacting API	Timeouts; verify serverUrl, token, CA; startup continues with warnings
+Diagnostic block
+bash
+
+# startup-phase view
+grep -nE 'Plugin .*(failed|requires|depends)|UnsatisfiedDependency|ClassNotFound|NoSuchMethod' \
+  /var/log/jenkins/jenkins.log | tail -100
+
+# inventory and integrity
+ls -l /var/lib/jenkins/plugins/*.hpi /var/lib/jenkins/plugins/*.jpi 2>/dev/null
+sha256sum /var/lib/jenkins/plugins/*.hpi 2>/dev/null > /tmp/plug.sha
+# compare with your signed manifest
+diff /tmp/plug.sha /path/to/plugins/SHA256SUMS
+
+# via API (once up)
+curl -sS -u admin:$TOKEN 'http://localhost:8080/pluginManager/api/json?pretty=1' \
+  | jq '.plugins[] | select(.enabled==false or .hasUpdate==true) | {shortName,version,enabled}'
+
+# dependency tree
+curl -sS -u admin:$TOKEN \
+  'http://localhost:8080/pluginManager/api/json?tree=plugins[shortName,version,dependencies[shortName,version]]' | jq .
+
+# Force a clean run with a specific log level to see classloading
+# (systemd drop-in)
+# Environment="JAVA_OPTS=... -Djava.util.logging.config.file=/etc/jenkins/logging.properties"
+
+Recovery procedures
+
+A. Bisect by disabling plugins (Jenkins will start with a minimal set):
+bash
+
+sudo systemctl stop jenkins
+sudo tar czf /var/backups/plugins-$(date +%F).tgz -C /var/lib/jenkins/plugins .
+sudo rm -f /var/lib/jenkins/plugins/*.hpi /var/lib/jenkins/plugins/*.jpi
+sudo systemctl start jenkins          # Jenkins starts with core only
+# verify /login 200, then re-add groups of plugins, restart, repeat
+
+B. Fix a missing dependency without internet — use the plugin manager on a staging host (see prior guide), then copy the resolved set in. Never cherry-pick a single .hpi.
+
+C. Roll back — restore plugins/ + WAR from the pre-upgrade backup in one shot; a mixed set is worse than the old set.
+1.5 Security realm failures (phase 5)
+Symptoms
+
+    Jenkins binds :8080, /login returns 200, but login always fails or everything 403.
+
+    Log: LDAP error …, javax.naming.CommunicationException, Unable to connect to the LDAP server.
+
+Root causes + fixes
+Cause	Diagnosis	Fix
+LDAP/AD unreachable	ldapsearch -H ldaps://ldap.internal -D 'cn=bind,…' -w "$PW" -b dc=… "(uid=test)"	Fix DNS/route/firewall; or raise timeouts in Jenkins; consider failover
+Expired bind password	ldapsearch returns 49 Invalid credentials	Rotate credential in Credentials; JCasC managerPasswordSecret
+CA not trusted	keytool -list -keystore $JAVA_HOME/lib/security/cacerts | grep -i your-ca	Import corporate CA: keytool -importcert -alias corpca -file corp.crt -keystore …/cacerts
+OIDC redirect URL / secret wrong	Browser redirect loop or invalid_client	Fix oic-auth config; verify jenkinsUrl matches public URL exactly
+SAML clock skew	saml errors about assertion time	Ensure chronyd/systemd-timesyncd synced
+Admin loses access	Locked out	Stop Jenkins; set <useSecurity>false</useSecurity> in config.xml temporarily; or inject admin via init.groovy.d (see below); restart; fix; re-enable security
+role-strategy misconfig	Logged in but no permissions	Restore $JENKINS_HOME/config.xml authz block or JCasC; use FullControlOnceLoggedIn bridge temporarily
+Emergency admin recovery (production)
+bash
+
+sudo systemctl stop jenkins
+sudo cp /var/lib/jenkins/config.xml /var/backups/config.xml.$(date +%F_%H%M)
+
+# 1. Option A: disable security temporarily
+sudo sed -i 's#<useSecurity>true</useSecurity>#<useSecurity>false</useSecurity>#' /var/lib/jenkins/config.xml
+sudo systemctl start jenkins
+# log in anonymously, fix security, re-enable, restart
+
+groovy
+
+// 2. Option B: init.groovy.d/00-emergency-admin.groovy
+import jenkins.model.*
+import hudson.security.*
+def i = Jenkins.get()
+i.setSecurityRealm(new HudsonPrivateSecurityRealm(false))
+i.getSecurityRealm().createAccount("breakglass","CHANGE_ME_NOW")
+i.save()
+
+    Rotate/remove any break-glass account immediately after recovery. Keep break-glass credentials in your vault, not in the groovy file.
+
+1.6 Credentials / secret.key mismatch (phase 6)
+Symptoms
+
+    Jobs run but fail at withCredentials with Unable to decrypt.
+
+    Startup log: Could not decrypt / InvalidCipherTextException.
+
+Cause & fix
+
+    credentials.xml restored without secret.key (or vice versa), or secret.key regenerated by a second boot.
+
+    Fix: restore secret.key and credentials.xml and identity.key.enc from the same backup. If the key is genuinely lost: you must re-enter all credentials (there is no recovery — that's the point).
+
+bash
+
+ls -l /var/lib/jenkins/secret.key /var/lib/jenkins/identity.key.enc /var/lib/jenkins/credentials.xml
+sha256sum /var/lib/jenkins/secret.key     # compare with backup manifest
+
+1.7 Job loading failures (phase 7)
+Symptoms
+
+    Jenkins starts but some jobs disappear, or the dashboard errors on a job.
+
+    Log: Failed to load job X, Could not instantiate, XStreamException.
+
+Cause & fix
+Cause	Fix
+Job config.xml references a plugin class not installed	Install the plugin (correct version) or edit the job XML to remove the reference
+Corrupt job XML (truncated write, disk full)	Restore jobs/<J>/config.xml from backup
+Job created by plugin that was uninstalled	Reinstall plugin or delete the job directory (back it up first)
+Massive job count + slow init	Offload to folder jobs; use multibranch; -Djenkins.model.Jenkins.logStartupPerformance=true to see which job is slow
+bash
+
+# find jobs whose XML fails to parse
+find /var/lib/jenkins/jobs -name config.xml -print0 | while IFS= read -r -d '' f; do
+  python3 -c "import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1])" "$f" 2>/dev/null \
+    || echo "BAD $f"
+done
+
+1.8 Agent / cloud / port binding issues at startup (phase 8–9)
+Cause	Diagnosis	Fix
+JNLP port 50000 blocked or already bound	ss -ltnp | grep 50000; journalctl → Address already in use	Free the port; change via -Dhudson.TcpSlaveAgentListener.port=…; use WebSocket launcher
+Kubernetes plugin can't reach API	kubectl auth can-i … --as=system:serviceaccount:jenkins:jenkins	Fix RBAC / token / CA; raise -Dorg.csanchez.jenkins.plugins.kubernetes.… timeouts
+Reverse proxy misconfig	UI shows "reverse proxy setup broken"	Set correct Jenkins URL; add X-Forwarded-* headers
+HTTP port 8080 already in use	ss -ltnp	Change --httpPort or kill the squatter
+Controller bound only on 127.0.0.1 but proxy can't reach	curl from proxy host fails	Bind correct --httpListenAddress or fix network
+1.9 Slow startup (not a "failure" but a production incident)
+Symptoms
+
+    systemctl status shows activating (start) for many minutes.
+
+    UI unavailable; agents time out.
+
+Causes & fixes
+Cause	Fix
+$JENKINS_HOME/war re-exploding each boot	--webroot=/var/cache/jenkins/war on fast local disk; pin
+Hundreds of plugins / large jobs tree	Prune plugins; split jobs into folders; move builds to agents
+Disk I/O slow on $JENKINS_HOME	Local SSD; never NFS
+Antivirus scanning $JENKINS_HOME	Exclude $JENKINS_HOME from AV
+Slow LDAP at realm init	Raise timeouts; fix DNS; use failover URL
+UpdateCenter fetch blocking	Point to local mirror / file: URL; disable update site
+-Xms too low → GC storms at init	Set -Xms = -Xmx
+Big fingerprints/	Prune; disable fingerprinting where not needed
+bash
+
+# per-phase startup timing
+JAVA_OPTS="$JAVA_OPTS -Djenkins.model.Jenkins.logStartupPerformance=true"
+# log lines: "Phase N: xxx ms"
+grep -i 'startup\|milestone\|phase' /var/log/jenkins/jenkins.log | tail -100
+
+Part 2 — Diagnostic Playbook (order of operations)
+
+When "Jenkins is down" pages you:
+bash
+
+# ── 0. What is the actual state? ────────────────────────────────
+systemctl status jenkins --no-pager
+curl -fsS -m 5 -o /dev/null -w '%{http_code}\n' http://localhost:8080/login || echo DOWN
+
+# ── 1. Is it the unit, the JVM, or the app? ────────────────────
+journalctl -u jenkins -b --no-pager -n 200
+ps -eo pid,args | grep -i 'jenkins.war' | grep -v grep
+
+# ── 2. Resources ────────────────────────────────────────────────
+free -h; df -h /var/lib/jenkins; df -i /var/lib/jenkins
+cat /sys/fs/cgroup/memory.max 2>/dev/null
+systemctl show jenkins | grep -Ei 'limit|memory|tasks'
+
+# ── 3. Ports ────────────────────────────────────────────────────
+ss -ltnp | grep -E ':(8080|50000)\b'
+
+# ── 4. Permissions ──────────────────────────────────────────────
+ls -ld /var/lib/jenkins /var/log/jenkins /var/cache/jenkins
+sudo -u jenkins test -w /var/lib/jenkins && echo OK || echo NOT-WRITABLE
+
+# ── 5. Config integrity ────────────────────────────────────────
+for f in /var/lib/jenkins/config.xml /var/lib/jenkins/hudson.model.UpdateCenter.xml; do
+  xmllint --noout "$f" && echo "OK $f" || echo "BAD $f"
+done
+ls -l /var/lib/jenkins/secret.key /var/lib/jenkins/credentials.xml
+
+# ── 6. Plugin failures ─────────────────────────────────────────
+grep -nE 'UnsatisfiedDependency|requires Jenkins|ClassNotFound|failed to load' \
+  /var/log/jenkins/jenkins.log | tail -50
+
+# ── 7. Heap/OOM ────────────────────────────────────────────────
+ls -lt /var/log/jenkins/*.hprof 2>/dev/null | head
+grep -iE 'OutOfMemory|GC overhead' /var/log/jenkins/jenkins.log | tail
+
+# ── 8. Slow start? ─────────────────────────────────────────────
+grep -iE 'startup|phase|milestone' /var/log/jenkins/jenkins.log | tail -50
+
+Escalation tree:
+
+    Unit won't start → §1.1
+
+    JVM dies → §1.2
+
+    App dies at boot → §1.3 / §1.4
+
+    Up but login broken → §1.5 / §1.6
+
+    Up but jobs missing/broken → §1.7
+
+    Up but agents/clouds broken → §1.8
+
+    Up but very slow → §1.9
+
+Part 3 — Best Practices: Monitoring & Controlling Startup
+3.1 systemd hardening + supervision
+ini
+
+# /etc/systemd/system/jenkins.service.d/override.conf
+[Service]
+User=jenkins
+Group=jenkins
+Environment="JAVA_OPTS=-Xms2g -Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/jenkins/ -Djava.awt.headless=true -Djenkins.model.Jenkins.logStartupPerformance=true"
+Environment="JENKINS_HOME=/var/lib/jenkins"
+Environment="JENKINS_OPTS=--httpListenAddress=127.0.0.1 --httpPort=8080 --webroot=/var/cache/jenkins/war"
+ExecStart=
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /usr/share/jenkins/jenkins.war $JENKINS_OPTS
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+LimitNOFILE=65536
+LimitNPROC=65536
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/jenkins /var/log/jenkins /var/cache/jenkins
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+Key points:
+
+    TimeoutStartSec=600 — Jenkins can take minutes; don't let systemd kill it.
+
+    StartLimitBurst=5 + RestartSec=30 — prevents flapping.
+
+    Restart=on-failure — auto-recovery from transient JVM crashes, but does not loop infinitely.
+
+    UMask=0027 — prevents world-readable configs.
+
+    ProtectSystem=full + ReadWritePaths — restricts writes to $JENKINS_HOME, logs, cache.
+
+Reload:
+bash
+
+sudo systemctl daemon-reload
+sudo systemctl restart jenkins
+
+3.2 Systemd watchdog (JDK 17+ / systemd 250+)
+ini
+
+# in the drop-in
+WatchdogSec=90s
+NotifyAccess=main
+
+Jenkins (via --enable-systemd-notify in some distributions) will sd_notify(WATCHDOG=1); if it hangs, systemd kills it and restarts. Verify:
+bash
+
+systemctl show jenkins | grep -Ei 'watchdog|notify'
+journalctl -u jenkins | grep -i watchdog
+
+If the packaged unit doesn't support it, rely on the liveness probe below + Restart=on-failure.
+3.3 HTTP liveness + readiness
+
+Liveness — is the JVM+app answering?
+bash
+
+curl -fsS -m 5 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/login
+# expect 200
+
+Readiness — is Jenkins fully initialized (not just serving login)?
+bash
+
+# root API returns version once init complete
+curl -fsS -m 5 -u admin:$TOKEN 'http://127.0.0.1:8080/api/json?tree=mode,nodeName,version'
+# expect {"mode":"NORMAL","nodeName":"","version":"2.479.1"}
+
+Deep health — /manage/pluginManager responds; agents reachable:
+bash
+
+curl -fsS -m 5 -u admin:$TOKEN http://127.0.0.1:8080/pluginManager/api/json?tree=plugins[shortName] -o /dev/null && echo plugins-ok
+curl -fsS -m 5 -u admin:$TOKEN 'http://127.0.0.1:8080/computer/api/json?tree=computer[displayName,offline]' | jq .
+
+3.4 Kubernetes probes
+yaml
+
+startupProbe:
+  httpGet:
+    path: /login
+    port: 8080
+  failureThreshold: 30        # 30 × 10s = 5 min max startup
+  periodSeconds: 10
+livenessProbe:
+  httpGet:
+    path: /login
+    port: 8080
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /login
+    port: 8080
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 2
+resources:
+  requests: { cpu: "1", memory: "3Gi" }
+  limits:   { cpu: "2", memory: "4Gi" }
+
+    startupProbe — the single most important probe. Without it, livenessProbe kills Jenkins mid-init and you get a restart loop.
+
+    failureThreshold × periodSeconds must be > your observed max startup time.
+
+    Set -Xmx < memory.limit (leave headroom for metaspace, OS, page cache).
+
+3.5 External monitoring (Prometheus + blackbox + alert rules)
+
+Scrape endpoints:
+
+    /prometheus (prometheus plugin) — JVM, heap, GC, executor, queue, builds.
+
+    /monitoring?format=json (monitoring plugin) — health summary.
+
+Prometheus scrape config:
+yaml
+
+scrape_configs:
+  - job_name: jenkins
+    metrics_path: /prometheus
+    scheme: https
+    basic_auth: { username: monitor, password_file: /etc/prometheus/jenkins_token }
+    static_configs: [{ targets: ["jenkins.example.com"] }]
+
+  - job_name: jenkins-blackbox
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs: [{ targets: ["https://jenkins.example.com/login"] }]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+Alert rules (starter set):
+yaml
+
+groups:
+  - name: jenkins
+    rules:
+      - alert: JenkinsDown
+        expr: up{job="jenkins"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Jenkins controller unreachable" }
+
+      - alert: JenkinsLoginNotOK
+        expr: probe_success{job="jenkins-blackbox"} == 0
+        for: 2m
+        labels: { severity: critical }
+
+      - alert: JenkinsRestartLoop
+        expr: increase(jenkins_uptime_seconds[15m]) < 60 and changes(jenkins_uptime_seconds[15m]) > 2
+        for: 10m
+        labels: { severity: critical }
+        annotations: { summary: "Jenkins restarting repeatedly" }
+
+      - alert: JenkinsHeapHigh
+        expr: jenkins_vm_memory_heap_used_bytes / jenkins_vm_memory_heap_max_bytes > 0.9
+        for: 10m
+        labels: { severity: warning }
+
+      - alert: JenkinsGCThrashing
+        expr: rate(jenkins_vm_gc_time_seconds_total[5m]) > 0.5
+        for: 10m
+        labels: { severity: warning }
+
+      - alert: JenkinsQueueBacklog
+        expr: jenkins_queue_size_value > 20
+        for: 15m
+        labels: { severity: warning }
+
+      - alert: JenkinsExecutorStarvation
+        expr: jenkins_executor_in_use_value / jenkins_executor_count_value > 0.95
+        for: 15m
+        labels: { severity: warning }
+
+      - alert: JenkinsDiskLow
+        expr: node_filesystem_avail_bytes{mountpoint="/var/lib/jenkins"} / node_filesystem_size_bytes{mountpoint="/var/lib/jenkins"} < 0.15
+        for: 10m
+        labels: { severity: critical }
+
+      - alert: JenkinsFileDescriptorsHigh
+        expr: jenkins_file_descriptor_ratio > 0.85
+        for: 10m
+        labels: { severity: warning }
+
+3.6 Log-based detection
+
+Ship /var/log/jenkins/jenkins.log to your SIEM/log store (Loki/ELK). Alert on these signatures:
+Signature	Meaning
+OutOfMemoryError	heap/metaspace exhaustion
+HudsonFailedToLoad	init failed → restart loop
+UnsatisfiedDependencyException / requires Jenkins	plugin failure
+AccessDeniedException	filesystem perms
+InvalidCipherTextException / Could not decrypt	secret.key mismatch
+Address already in use	port conflict
+SlaveComputer.*Connection.*closed (spikes)	agent connectivity
+scriptApproval additions	security event
+Restarting / shutting down in bursts	restart loop
+bash
+
+# example: watch for OOM in the last hour
+journalctl -u jenkins --since "1 hour ago" | grep -ciE 'OutOfMemoryError|GC overhead limit'
+
+3.7 Controlling planned restarts (safe reload vs hard restart)
+Action	Command	Effect
+Reload XML config from disk	curl -u admin:$TOKEN -X POST /reload	No JVM restart; does not reload plugins/keys
+Quiet down (drain builds)	POST /quietDown	Stops scheduling new builds
+Cancel quiet down	POST /cancelQuietDown	Resume
+Safe restart	POST /safeRestart	Waits for builds, then restarts
+Hard restart	systemctl restart jenkins	Kills in-flight builds
+Prepare for shutdown	POST /prepareShutdown	Marker for agents
+
+Production restart runbook:
+bash
+
+# 1. announce + quiet
+curl -fsS -u admin:$TOKEN -X POST https://jenkins.example.com/quietDown
+# 2. wait for zero running builds
+while :; do
+  n=$(curl -sS -u admin:$TOKEN https://jenkins.example.com/computer/api/json | jq '[.computer[].executors[].currentExecutable]|map(select(.!=null))|length')
+  [ "$n" -eq 0 ] && break; sleep 15
+done
+# 3. backup
+tar czf /var/backups/jenkins-$(date +%F_%H%M).tgz -C /var/lib jenkins/
+# 4. restart
+sudo systemctl restart jenkins
+# 5. wait for readiness (not just liveness)
+until curl -fsS -m 3 -u admin:$TOKEN 'http://127.0.0.1:8080/api/json?tree=mode' >/dev/null 2>&1; do sleep 5; done
+# 6. un-quiet
+curl -fsS -u admin:$TOKEN -X POST https://jenkins.example.com/cancelQuietDown
+
+3.8 Preventative controls (so load failures don't happen)
+
+    Disk watchdogs
+
+        Per-job build discarders (logRotator) — always set.
+
+        disk-usage plugin + alert at 80% of $JENKINS_HOME.
+
+        ws-cleanup (cleanWs()) at end of every pipeline.
+
+        Monitor inodes too — archive/ and builds/*/log are the usual culprits.
+
+    Heap & JVM
+
+        -Xms == -Xmx; -XX:MaxMetaspaceSize; HeapDumpOnOutOfMemoryError.
+
+        Alert on heap > 85%, GC time rate, thread count.
+
+        Keep -Xmx ≤ 70% of container limit; numExecutors: 0 on controller.
+
+    Plugin discipline (see previous guide)
+
+        Pin everything in plugins.txt; stage before prod.
+
+        Upgrade in windows with backup + rollback tested.
+
+        Uninstall unused plugins (don't just disable).
+
+    Config integrity
+
+        xmllint all XML nightly; alert on parse failures.
+
+        Back up secret.key + identity.key.enc + credentials.xml + plugins/ + jobs/ together, verified restore quarterly.
+
+        Git-track jenkins.yaml (JCasC) + plugins.txt + unit file.
+
+    Security realm resilience
+
+        LDAP with failover URL; test bind creds expiry via monitoring.
+
+        CA in cacerts baked into the base image.
+
+        Break-glass account in vault, not in JCasC.
+
+        jenkinsUrl matches public URL (prevents OIDC/SAML redirect loops).
+
+    Reverse proxy
+
+        Correct X-Forwarded-* headers; proxy_read_timeout 3600s; proxy_buffering off for pipeline logs.
+
+        TLS at the proxy; controller on loopback.
+
+    Startup budget
+
+        Track Time to ready as an SLI; alert if > 2× baseline.
+
+        Keep startup < 3–5 min; if not, find the slow phase with logStartupPerformance=true.
+
+    Failover / HA (optional, for critical)
+
+        Active-passive controller + shared read-only $JENKINS_HOME snapshot; or
+
+        CloudBees HA; or
+
+        Blue/green controllers behind a proxy (both share nothing; cut over with jenkinsUrl + agent reconfigure).
+
+Part 4 — One-Page Runbook (paste into your incident wiki)
+text
+
+JENKINS DOWN — TRIAGE (target: < 5 min to diagnosis)
+
+1) systemctl status jenkins --no-pager
+   └─ failed? → journalctl -u jenkins -b -n 200
+      ├─ unit/env error → §1.1 (fix unit, daemon-reload, restart)
+      ├─ JVM error      → §1.2 (java -version, JAVA_OPTS, memory limit)
+      └─ app error      → step 2
+
+2) Disk / perms / config
+   df -h /var/lib/jenkins; df -i /var/lib/jenkins
+   sudo -u jenkins test -w /var/lib/jenkins || echo NOT-WRITABLE
+   xmllint --noout /var/lib/jenkins/config.xml
+   └─ disk full → purge builds/workspaces, set discarders
+   └─ bad XML  → restore from backup
+   └─ perms    → chown -R jenkins:jenkins
+
+3) Plugins
+   grep -E 'UnsatisfiedDependency|requires Jenkins|ClassNotFound' /var/log/jenkins/jenkins.log | tail
+   └─ re-resolve with jenkins-plugin-manager (staging), swap plugins/ while stopped
+   └─ or roll back plugins/ + WAR from backup
+
+4) Login broken / 403
+   └─ LDAP: ldapsearch; OIDC: jenkinsUrl; SAML: clock
+   └─ emergency: stop, useSecurity=false or init.groovy.d admin, start, fix, revert
+
+5) Credentials "cannot decrypt"
+   └─ restore secret.key + identity.key.enc + credentials.xml together from same backup
+
+6) Slow start
+   └─ -Djenkins.model.Jenkins.logStartupPerformance=true → find phase
+   └─ check --webroot, plugin count, LDAP timeout, update-center URL
+
+RECOVERY VALIDATION (must all pass):
+  curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/login   # 200
+  curl -fsS -u admin:$TOKEN http://127.0.0.1:8080/api/json?tree=mode         # NORMAL
+  curl -fsS -u admin:$TOKEN http://127.0.0.1:8080/computer/api/json | jq     # agents online
+  journalctl -u jenkins -b | grep -ciE 'UnsatisfiedDependency|HudsonFailedToLoad'  # 0
+  POST /cancelQuietDown
+
+Part 5 — Reference Table: Symptom → Most Likely Cause → First Command
+Symptom	Most likely cause	First command
+Service failed immediately	Unit/env/JVM flags	journalctl -u jenkins -b -n 200
+status=1/FAILURE no log	JAVA_HOME / jar path	systemctl cat jenkins; sudo -u jenkins java -version
+Hangs in activating	Slow init (plugins/jobs/LDAP) or OOM	grep -i startup jenkins.log; ps -eo pid,args
+Unrecognized VM option	Removed JVM flag	systemctl show jenkins | grep JAVA_OPTS
+UnsupportedClassVersionError	Wrong JDK	java -version; update-alternatives --config java
+Could not reserve enough space for heap	-Xmx > RAM/cgroup	free -h; cat /sys/fs/cgroup/memory.max
+AccessDeniedException	Ownership / SELinux	ls -ld $JENKINS_HOME; ausearch -m avc -ts recent
+Permission denied writing	jenkins user perms	sudo -u jenkins touch $JENKINS_HOME/x
+No space left on device	Disk/inodes full	df -h; df -i
+Address already in use	Port conflict	ss -ltnp | grep -E ':(8080|50000)'
+UnsatisfiedDependencyException	Missing plugin dep	jenkins-plugin-manager re-resolve
+requires Jenkins 2.xxx	Core too old	Upgrade core (window)
+ClassNotFoundException	Plugin skew / disabled	/pluginManager/api/json
+HudsonFailedToLoad	Init failed (broad)	Full startup log tail
+Login always fails	LDAP/AD/OIDC/SAML	ldapsearch; check jenkinsUrl
+All users 403	role-strategy / authz	Restore authz config / JCasC
+Could not decrypt credentials	secret.key mismatch	Restore key+creds from same backup
+Jobs missing / red dashboard	Job XML vs plugins	find jobs -name config.xml + xmllint
+reverse proxy setup broken	jenkinsUrl mismatch	Set correct Jenkins URL
+Agents can't connect	Port 50000 / WS launcher	ss -ltnp; firewall; WebSocket
+OOM shortly after start	Heap too small / leak	.hprof in /var/log/jenkins/; raise -Xmx
+Restart loop	Failing init	StartLimitBurst + fix root cause
+Part 6 — Summary
+
+    Diagnose by phase: unit → JVM → filesystem → plugins → realm → credentials → jobs → nodes → HTTP. The phase at which it dies dictates the fix.
+
+    The top three production causes of "Jenkins won't load" are (1) plugin dependency/version failures, (2) filesystem/permissions/disk on $JENKINS_HOME, (3) JVM heap/JDK mismatch.
+
+    Control startup with systemd TimeoutStartSec + Restart=on-failure + StartLimitBurst, and with Kubernetes startupProbe (never rely on livenessProbe alone).
+
+    Monitor with /prometheus + blackbox /login + log-based alerts on the signatures above; alert on restart loops, heap, disk, and HudsonFailedToLoad.
+
+    Prevent with pinned plugins/WAR, staged upgrades, verified backups of secret.key + credentials.xml + plugins/ + jobs/ together, build discarders, and numExecutors: 0 on the controller.
+
+    Recover with the runbook in Part 4: quiet down → backup → fix root cause → restart → wait for readiness → cancel quiet down → validate.

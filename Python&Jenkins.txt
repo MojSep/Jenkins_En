@@ -1,0 +1,2051 @@
+﻿Python ↔ Jenkins in Production — Complete Integration & Automation Guide
+
+    Audience: DevOps/SRE engineers who automate Jenkins from Python and run Python inside Jenkins pipelines. Everything here is production-grade: retries, timeouts, idempotency, structured logging, exit codes suitable for cron and alerting.
+
+Part 1 — The Five Integration Patterns
+
+There are exactly five ways Python and Jenkins meet in production. Pick the right one per task.
+text
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│  1. Python OUTSIDE Jenkins  →  Jenkins REST API                          │
+│     scripts, cron, controllers, alerting, orchestration                  │
+│     (python-jenkins, requests, jenkinsapi)                               │
+├──────────────────────────────────────────────────────────────────────────┤
+│  2. Python INSIDE Jenkins  →  `sh 'python …'` in Jenkinsfile             │
+│     build steps, deploy scripts, test runners                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│  3. Python AS BUILD TARGET  →  Jenkins runs Python project (pip, pytest) │
+│     the job IS the Python project's CI                                   │
+├──────────────────────────────────────────────────────────────────────────┤
+│  4. Python DRIVING Jenkins config  →  JCasC, Job DSL, plugin-manager     │
+│     declarative job/plugin/config management                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│  5. Python AS WEBHOOK RECEIVER / TRIGGER  →  Flask/FastAPI → Jenkins     │
+│     GitHub/GitLab/Sonar → Python bridge → Jenkins                       │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Pattern	Runs where	Best for
+1. REST client	Ops host (cron, systemd timer, controller VM)	Monitoring, cleanup, reporting, orchestration
+2. sh 'python …'	Agent inside a build	Deploy scripts, custom build logic, report generation
+3. Python project CI	Agent	pytest, coverage, black, bandit, packaging
+4. Config generation	Ops host / CI	JCasC, plugins.txt, Job DSL from Python data structures
+5. Webhook bridge	Any Python service	Translate third-party webhooks → POST /job/X/buildWithParameters
+
+Rule of thumb:
+
+    "I want to inspect / control Jenkins" → Pattern 1.
+
+    "I want Jenkins to run my Python code" → Pattern 2.
+
+    "I want Jenkins to test my Python project" → Pattern 3.
+
+    "I want my Python app to trigger a build" → Pattern 5.
+
+    "I want to manage job/plugin config from code" → Pattern 4.
+
+Part 2 — Libraries
+Library	Use when	Notes
+requests	Anything — full control over URL/body/headers	Default choice. Transparent, debuggable
+python-jenkins	High-level convenience (create_job, build_job)	Wraps the API; occasionally lags core features
+jenkinsapi	Similar to above; more object-oriented	Slower-moving upstream
+jenkins-job-builder	YAML → jobs (Python CLI)	Good for legacy freestyle matrices
+requests + urllib3.Retry	Production client	Retries, backoff, circuit-breaking
+tenacity	Retry decorators	Cleaner than manual loops
+vault / hvac	Secrets from Vault	Never hardcode tokens
+prometheus_client	Push metrics	For pushgateway / long scripts
+
+Production baseline: requests + urllib3.Retry + tenacity + logging + argparse + pydantic (config).
+
+Install:
+bash
+
+pip install requests urllib3 tenacity pydantic pyyaml hvac prometheus_client
+
+Part 3 — Reusable Production Client
+
+Save as jenkins_client.py. This is the foundation for every script below.
+python
+
+#!/usr/bin/env python3
+"""
+jenkins_client.py — production-grade Jenkins REST client.
+
+Features:
+  - CRUD over the REST API with retries and backoff
+  - CSRF crumb handling (auto-detect enabled/disabled)
+  - Client-side rate limiting (token bucket) to protect the controller
+  - Structured logging + exit codes
+  - Full type hints
+
+Env vars:
+  JENKINS_URL         e.g. https://jenkins.example.com
+  JENKINS_USER        username
+  JENKINS_TOKEN       API token (NOT password)
+  JENKINS_CA_BUNDLE   path to CA bundle (default: requests default)
+  JENKINS_VERIFY_TLS  "true"/"false" (default true)
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+import threading
+from typing import Any, Iterator, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+log = logging.getLogger("jenkins")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Errors
+# ──────────────────────────────────────────────────────────────────────
+
+class JenkinsError(Exception):
+    def __init__(self, msg: str, status: Optional[int] = None, body: str = ""):
+        super().__init__(msg)
+        self.status = status
+        self.body = body
+
+
+class JenkinsNotFound(JenkinsError):
+    pass
+
+
+class JenkinsAuthError(JenkinsError):
+    pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Token-bucket rate limiter
+# ──────────────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    """N calls per second, shared across threads. Protects the controller."""
+
+    def __init__(self, rate: float = 5.0, burst: int = 10):
+        self.rate = rate
+        self.burst = burst
+        self._tokens = float(burst)
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            self._tokens = min(self.burst, self._tokens + elapsed * self.rate)
+            self._last = now
+            if self._tokens < 1.0:
+                wait = (1.0 - self._tokens) / self.rate
+                time.sleep(wait)
+                self._tokens = 0.0
+            else:
+                self._tokens -= 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Client
+# ──────────────────────────────────────────────────────────────────────
+
+class JenkinsClient:
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        user: Optional[str] = None,
+        token: Optional[str] = None,
+        *,
+        verify: Optional[bool] = None,
+        ca_bundle: Optional[str] = None,
+        timeout: float = 30.0,
+        max_retries: int = 3,
+        rate: float = 5.0,
+    ) -> None:
+        self.url = (url or os.environ["JENKINS_URL"]).rstrip("/")
+        self.user = user or os.environ["JENKINS_USER"]
+        self.token = token or os.environ["JENKINS_TOKEN"]
+        self.timeout = timeout
+        self._crumb: Optional[tuple[str, str]] = None
+        self._limiter = RateLimiter(rate=rate)
+
+        # TLS
+        if ca_bundle is None:
+            ca_bundle = os.environ.get("JENKINS_CA_BUNDLE") or True
+        if verify is None:
+            verify = os.environ.get("JENKINS_VERIFY_TLS", "true").lower() != "false"
+
+        # Session
+        self.s = requests.Session()
+        self.s.auth = (self.user, self.token)
+        self.s.verify = verify if ca_bundle is True else ca_bundle
+        self.s.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "jenkins-py-client/1.0",
+        })
+
+        # Retries: connection + 429/5xx on idempotent methods
+        retry = Retry(
+            total=max_retries,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "HEAD", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+        self.s.mount("http://", adapter)
+        self.s.mount("https://", adapter)
+
+        # Warm-up: verify auth early (fail fast in cron)
+        try:
+            self.whoami()
+        except JenkinsAuthError:
+            raise
+        except Exception as e:
+            log.warning("warm-up failed: %s", e)
+
+    # ── core request plumbing ──────────────────────────────────────
+    def _crumb_headers(self) -> dict[str, str]:
+        if self._crumb is None:
+            try:
+                r = self.s.get(
+                    f"{self.url}/crumbIssuer/api/json",
+                    timeout=self.timeout,
+                )
+                if r.status_code == 404:
+                    self._crumb = ("", "")
+                else:
+                    r.raise_for_status()
+                    j = r.json()
+                    self._crumb = (j["crumbRequestField"], j["crumb"])
+            except requests.RequestException as e:
+                log.warning("crumb fetch failed: %s", e)
+                self._crumb = ("", "")
+        f, v = self._crumb
+        return {f: v} if f else {}
+
+    def _request(self, method: str, path: str, **kw: Any) -> requests.Response:
+        self._limiter.acquire()
+        headers = dict(kw.pop("headers", {}))
+        if method.upper() in ("POST", "PUT", "DELETE"):
+            headers.update(self._crumb_headers())
+        url = f"{self.url}{path}"
+        try:
+            r = self.s.request(method, url, headers=headers, timeout=self.timeout, **kw)
+        except requests.RequestException as e:
+            raise JenkinsError(f"{method} {path} network error: {e}") from e
+
+        if r.status_code in (401, 403):
+            raise JenkinsAuthError(f"{method} {path} -> {r.status_code}", r.status_code, r.text[:300])
+        if r.status_code == 404:
+            raise JenkinsNotFound(f"{method} {path} -> 404", 404, r.text[:300])
+        if r.status_code >= 400:
+            raise JenkinsError(f"{method} {path} -> {r.status_code}", r.status_code, r.text[:300])
+        return r
+
+    def get_json(self, path: str) -> Any:
+        return self._request("GET", path).json()
+
+    def post(self, path: str, **kw: Any) -> requests.Response:
+        return self._request("POST", path, **kw)
+
+    def put_xml(self, path: str, xml: str) -> requests.Response:
+        return self._request(
+            "POST", path,
+            data=xml.encode("utf-8"),
+            headers={"Content-Type": "application/xml"},
+        )
+
+    # ── identity / meta ───────────────────────────────────────────
+    def whoami(self) -> dict[str, Any]:
+        return self.get_json("/whoAmI/api/json")
+
+    def version(self) -> str:
+        return self.get_json("/api/json?tree=version")["version"]
+
+    def mode(self) -> str:
+        return self.get_json("/api/json?tree=mode")["mode"]
+
+    # ── jobs ──────────────────────────────────────────────────────
+    def jobs(self) -> list[dict[str, Any]]:
+        return self.get_json("/api/json?tree=jobs[name,url,color]")["jobs"]
+
+    def job_info(self, name: str) -> dict[str, Any]:
+        return self.get_json(
+            f"/job/{_q(name)}/api/json"
+            "?tree=name,color,disabled,lastBuild[number,result,duration,timestamp],"
+            "builds[number,result,duration,timestamp]{0,5}"
+        )
+
+    def create_job(self, name: str, xml: str) -> None:
+        self.put_xml(f"/createItem?name={_q(name)}", xml)
+
+    def copy_job(self, src: str, dst: str) -> None:
+        self.post(f"/createItem?name={_q(dst)}&mode=copy&from={_q(src)}")
+
+    def delete_job(self, name: str) -> None:
+        self.post(f"/job/{_q(name)}/doDelete")
+
+    def disable_job(self, name: str, disabled: bool = True) -> None:
+        self.post(f"/job/{_q(name)}/{'disable' if disabled else 'enable'}")
+
+    def build(self, name: str, params: Optional[dict[str, Any]] = None, *, wait: bool = False) -> Optional[int]:
+        if params:
+            q = "&".join(f"{k}={_q(v)}" for k, v in params.items())
+            self.post(f"/job/{_q(name)}/buildWithParameters?{q}")
+        else:
+            self.post(f"/job/{_q(name)}/build?delay=0sec")
+        if wait:
+            return self.wait_for_completion(name)
+        return None
+
+    def last_build(self, name: str) -> Optional[dict[str, Any]]:
+        try:
+            return self.get_json(
+                f"/job/{_q(name)}/lastBuild/api/json"
+                "?tree=number,result,building,duration,timestamp,url"
+            )
+        except JenkinsNotFound:
+            return None
+
+    def build_info(self, name: str, number: int) -> dict[str, Any]:
+        return self.get_json(
+            f"/job/{_q(name)}/{number}/api/json"
+            "?tree=number,result,building,duration,timestamp,url,artifacts[fileName,relativePath]"
+        )
+
+    def console_text(self, name: str, number: int) -> str:
+        return self._request(
+            "GET", f"/job/{_q(name)}/{number}/consoleText"
+        ).text
+
+    def artifacts(self, name: str, number: int) -> list[dict[str, str]]:
+        return self.build_info(name, number).get("artifacts", [])
+
+    def download_artifact(self, name: str, number: int, rel_path: str, dst: str) -> None:
+        url = f"/job/{_q(name)}/{number}/artifact/{rel_path}"
+        r = self._request("GET", url)
+        with open(dst, "wb") as f:
+            f.write(r.content)
+
+    def stop_build(self, name: str, number: int) -> None:
+        self.post(f"/job/{_q(name)}/{number}/stop")
+
+    def wait_for_completion(
+        self, name: str, *, poll: float = 5.0, timeout: float = 3600.0
+    ) -> int:
+        deadline = time.monotonic() + timeout
+        # wait for the build to start
+        while time.monotonic() < deadline:
+            lb = self.last_build(name)
+            if lb and lb.get("building") is not None and not lb.get("building"):
+                return int(lb["number"])
+            if lb and lb.get("number") and lb.get("building"):
+                break
+            time.sleep(poll)
+        # wait for it to finish
+        num = lb["number"]  # type: ignore[index]
+        while time.monotonic() < deadline:
+            info = self.build_info(name, num)
+            if not info.get("building"):
+                log.info("%s #%s finished result=%s", name, num, info.get("result"))
+                return num
+            time.sleep(poll)
+        raise JenkinsError(f"timeout waiting for {name} to finish")
+
+    # ── queue ─────────────────────────────────────────────────────
+    def queue(self) -> list[dict[str, Any]]:
+        return self.get_json(
+            "/queue/api/json?tree=items[id,task[name,url],why,inQueueSince,"
+            "stuck,blocked,buildable,params]"
+        )["items"]
+
+    def cancel_queue_item(self, item_id: int) -> None:
+        self.post(f"/queue/cancelItem?id={item_id}")
+
+    # ── nodes / agents ────────────────────────────────────────────
+    def nodes(self) -> list[dict[str, Any]]:
+        return self.get_json(
+            "/computer/api/json?tree=computer[displayName,offline,temporarilyOffline,"
+            "idle,numExecutors,offlineCauseReason,assignedLabels[name]]"
+        )["computer"]
+
+    def set_node_offline(self, name: str, reason: str, offline: bool = True) -> None:
+        if offline:
+            self.post(f"/computer/{_q(name)}/toggleOffline?offlineMessage={_q(reason)}")
+        else:
+            self.post(f"/computer/{_q(name)}/toggleOffline")
+
+    # ── plugins ───────────────────────────────────────────────────
+    def plugins(self) -> list[dict[str, Any]]:
+        return self.get_json(
+            "/pluginManager/api/json?tree=plugins[shortName,longName,version,"
+            "enabled,hasUpdate,deleted,pinned]"
+        )["plugins"]
+
+    # ── script console (admin) ────────────────────────────────────
+    def run_groovy(self, script: str) -> str:
+        """Execute Groovy via /scriptText. RCE-equivalent — admin only."""
+        return self._request(
+            "POST", "/scriptText",
+            data=script.encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ).text
+
+    # ── admin actions ─────────────────────────────────────────────
+    def reload_config(self) -> None:
+        self.post("/reload")
+
+    def safe_restart(self) -> None:
+        self.post("/safeRestart")
+
+    def quiet_down(self) -> None:
+        self.post("/quietDown")
+
+    def cancel_quiet_down(self) -> None:
+        self.post("/cancelQuietDown")
+
+    # ── helpers ───────────────────────────────────────────────────
+    def iter_jobs(self) -> Iterator[dict[str, Any]]:
+        yield from self.jobs()
+
+
+def _q(value: Any) -> str:
+    """URL-quote, preserving slashes for folder jobs."""
+    from urllib.parse import quote
+    return quote(str(value), safe="")
+
+Why this design matters in production:
+Concern	Handled by
+Controller overload	RateLimiter(rate=5) — max 5 API calls/sec
+Transient 5xx / 429	urllib3.Retry(backoff_factor=0.5)
+CSRF without knowing state	_crumb_headers() auto-detects
+Fail-fast on bad creds	warm-up whoami() in __init__
+Logging without secrets	never log self.token; use request exceptions
+Folder jobs (/job/A/job/B)	_q() preserves / after quoting each segment — pass A/B and it works via job/A/job/B on the server
+Timeouts	explicit timeout=30 everywhere
+Part 4 — Daily Automation (cron / systemd timer)
+
+All scripts below:
+
+    Read config from env (JENKINS_URL, JENKINS_USER, JENKINS_TOKEN).
+
+    Emit JSON to stdout (pipe to jq, jq . > /var/log/jenkins/checks/YYYY-MM-DD.json).
+
+    Exit 0 on OK, 1 on non-critical, 2 on critical (for cron alerting).
+
+    Are idempotent and safe to run every minute.
+
+4.1 daily_health.py — availability, readiness, agents, queue, disk
+python
+
+#!/usr/bin/env python3
+"""
+daily_health.py — single-shot health probe for Jenkins.
+
+Exit codes:
+  0 = healthy
+  1 = degraded  (offline agents, queue backlog, disk warning)
+  2 = down      (HTTP / API / auth fail)
+
+Sample output:
+  {"ts": "...", "ok": true, "checks": {...}}
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+import requests
+
+from jenkins_client import JenkinsClient, JenkinsAuthError, JenkinsError
+
+DISK_WARN = int(os.getenv("DISK_WARN_PCT", "80"))
+DISK_CRIT = int(os.getenv("DISK_CRIT_PCT", "90"))
+QUEUE_WARN = int(os.getenv("QUEUE_WARN", "20"))
+QUEUE_CRIT = int(os.getenv("QUEUE_CRIT", "100"))
+AGENT_WARN = int(os.getenv("AGENT_WARN", "1"))
+
+
+def check_http(url: str, timeout: float = 5.0) -> dict:
+    t0 = time.monotonic()
+    try:
+        r = requests.get(f"{url}/login", timeout=timeout, allow_redirects=True)
+        return {"ok": r.status_code in (200, 403), "status": r.status_code,
+                "latency_ms": int((time.monotonic() - t0) * 1000)}
+    except requests.RequestException as e:
+        return {"ok": False, "error": str(e)}
+
+
+def check_api(client: JenkinsClient) -> dict:
+    t0 = time.monotonic()
+    try:
+        v = client.version()
+        mode = client.mode()
+        return {"ok": True, "version": v, "mode": mode,
+                "latency_ms": int((time.monotonic() - t0) * 1000)}
+    except JenkinsAuthError:
+        return {"ok": False, "error": "auth_failed"}
+    except JenkinsError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def check_agents(client: JenkinsClient) -> dict:
+    nodes = client.nodes()
+    offline = [n for n in nodes if n["offline"]]
+    builtin = [n for n in offline if n["displayName"] == "Built-In Node"]
+    return {
+        "ok": len([n for n in offline if n not in builtin]) <= AGENT_WARN,
+        "total": len(nodes),
+        "offline": [n["displayName"] for n in offline],
+        "detail": [{"name": n["displayName"], "reason": n.get("offlineCauseReason", "")}
+                   for n in offline],
+    }
+
+
+def check_queue(client: JenkinsClient) -> dict:
+    q = client.queue()
+    stuck = [i for i in q if i.get("stuck")]
+    oldest = 0
+    if q:
+        now = time.time() * 1000
+        oldest = int(max(now - i["inQueueSince"] for i in q) / 1000)
+    status = "ok"
+    if len(q) >= QUEUE_CRIT:
+        status = "critical"
+    elif len(q) >= QUEUE_WARN or len(stuck) > 0:
+        status = "warning"
+    return {"ok": status == "ok", "status": status, "depth": len(q),
+            "stuck": len(stuck), "oldest_sec": oldest}
+
+
+def check_disk(client: JenkinsClient, home: str = "/var/lib/jenkins") -> dict:
+    """Uses Groovy via /scriptText (requires admin)."""
+    try:
+        used = os.statvfs(home)
+        total = used.f_blocks * used.f_frsize
+        free = used.f_bavail * used.f_frsize
+        pct = int(100 * (total - free) / total) if total else 0
+        status = "ok"
+        if pct >= DISK_CRIT:
+            status = "critical"
+        elif pct >= DISK_WARN:
+            status = "warning"
+        return {"ok": status == "ok", "status": status,
+                "percent_used": pct,
+                "free_gb": round(free / 1024**3, 2),
+                "total_gb": round(total / 1024**3, 2)}
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def main() -> int:
+    client = JenkinsClient()
+    url = os.environ["JENKINS_URL"].rstrip("/")
+
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "url": url,
+        "checks": {},
+    }
+
+    # 1. HTTP
+    http = check_http(url)
+    result["checks"]["http"] = http
+    if not http["ok"]:
+        print(json.dumps(result, indent=2))
+        return 2
+
+    # 2. API
+    api = check_api(client)
+    result["checks"]["api"] = api
+    if not api["ok"]:
+        print(json.dumps(result, indent=2))
+        return 2
+
+    # 3. Agents
+    agents = check_agents(client)
+    result["checks"]["agents"] = agents
+
+    # 4. Queue
+    queue = check_queue(client)
+    result["checks"]["queue"] = queue
+
+    # 5. Disk (best effort — needs admin)
+    try:
+        disk = check_disk(client)
+    except Exception as e:
+        disk = {"ok": True, "skipped": str(e)}
+    result["checks"]["disk"] = disk
+
+    # 6. Aggregate
+    critical = [k for k, v in result["checks"].items()
+                if isinstance(v, dict) and v.get("status") == "critical"]
+    degraded = [k for k, v in result["checks"].items()
+                if isinstance(v, dict) and v.get("status") == "warning"]
+
+    result["ok"] = not critical and not degraded
+    result["critical"] = critical
+    result["degraded"] = degraded
+
+    print(json.dumps(result, indent=2))
+    if critical:
+        return 2
+    if degraded:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+cron:
+cron
+
+# every 2 minutes
+*/2 * * * * ops /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_health.py >> /var/log/jenkins-checks/health.log 2>&1
+
+systemd timer (production-preferred):
+ini
+
+# /etc/systemd/system/jenkins-health.service
+[Unit]
+Description=Jenkins health probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ops
+EnvironmentFile=/etc/jenkins-ops/env
+ExecStart=/opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_health.py
+StandardOutput=append:/var/log/jenkins-checks/health.log
+StandardError=append:/var/log/jenkins-checks/health.log
+
+ini
+
+# /etc/systemd/system/jenkins-health.timer
+[Unit]
+Description=Run Jenkins health every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+bash
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins-health.timer
+
+4.2 daily_queue_cleanup.py — cancel stale / duplicate / stuck items
+python
+
+#!/usr/bin/env python3
+"""
+daily_queue_cleanup.py — prune the Jenkins build queue.
+
+Cancels:
+  - items in queue > MAX_AGE_SEC (default 30 min)
+  - exact duplicates (same job + same params)
+  - items with `stuck: true`
+
+Never cancels items whose "why" indicates they're about to start.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient, JenkinsError
+
+MAX_AGE_SEC = int(os.getenv("QUEUE_MAX_AGE_SEC", str(30 * 60)))
+DUPLICATES = os.getenv("QUEUE_CANCEL_DUPLICATES", "true").lower() == "true"
+STUCK_ONLY = os.getenv("QUEUE_STUCK_ONLY", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+
+def fingerprint(item: dict) -> str:
+    task = item.get("task", {}).get("name", "")
+    params = sorted((p.get("name", ""), str(p.get("value", ""))) for p in item.get("params", []))
+    return hashlib.sha256((task + json.dumps(params, sort_keys=True)).encode()).hexdigest()
+
+
+def main() -> int:
+    client = JenkinsClient()
+    now = time.time() * 1000
+    items = client.queue()
+
+    to_cancel: list[tuple[int, str, dict]] = []
+    seen: dict[str, list[dict]] = defaultdict(list)
+
+    # 1. sort by inQueueSince ascending (oldest first)
+    items.sort(key=lambda i: i["inQueueSince"])
+
+    for item in items:
+        age = (now - item["inQueueSince"]) / 1000
+        reason = None
+
+        # stuck
+        if item.get("stuck"):
+            reason = "stuck"
+
+        # duplicate
+        if DUPLICATES:
+            fp = fingerprint(item)
+            if seen[fp]:
+                reason = f"duplicate_of_{seen[fp][0]['id']}"
+            else:
+                seen[fp].append(item)
+
+        # stale
+        if age > MAX_AGE_SEC and not item.get("why", "").startswith("Waiting for next available executor"):
+            reason = reason or f"age_{int(age)}s"
+
+        if STUCK_ONLY and not item.get("stuck"):
+            continue
+        if reason:
+            to_cancel.append((item["id"], reason, item))
+
+    result = {"ts": datetime.now(timezone.utc).isoformat(),
+              "total": len(items), "cancelled": [], "dry_run": DRY_RUN}
+
+    for item_id, reason, item in to_cancel:
+        job = item.get("task", {}).get("name", "?")
+        entry = {"id": item_id, "job": job, "reason": reason,
+                 "age_sec": int((now - item["inQueueSince"]) / 1000)}
+        if DRY_RUN:
+            entry["dry_run"] = True
+        else:
+            try:
+                client.cancel_queue_item(item_id)
+                entry["cancelled"] = True
+            except JenkinsError as e:
+                entry["cancelled"] = False
+                entry["error"] = str(e)
+        result["cancelled"].append(entry)
+
+    print(json.dumps(result, indent=2))
+    # non-critical: never fail cron because of cleanup
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+4.3 daily_stuck_build_killer.py — abort hung builds
+python
+
+#!/usr/bin/env python3
+"""
+daily_stuck_build_killer.py — abort builds that have run too long.
+
+Two thresholds:
+  - MAX_RUNTIME_SEC      (default 2h)         → abort
+  - MAX_IDLE_SEC         (default 30m)        → abort if no log growth
+
+Detects idle by comparing the console tail length between polls.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient, JenkinsError
+
+MAX_RUNTIME_SEC = int(os.getenv("MAX_RUNTIME_SEC", str(2 * 3600)))
+MAX_IDLE_SEC = int(os.getenv("MAX_IDLE_SEC", str(30 * 60)))
+IDLE_POLL_SEC = int(os.getenv("IDLE_POLL_SEC", "60"))
+EXCLUDE = os.getenv("STUCK_EXCLUDE", "").split(",") if os.getenv("STUCK_EXCLUDE") else []
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+
+def running_builds(client: JenkinsClient) -> list[dict]:
+    """Enumerate every executor across every node for current builds."""
+    data = client.get_json(
+        "/computer/api/json?tree=computer[displayName,executors["
+        "currentExecutable[number,url,fullDisplayName,timestamp,estimatedDuration,"
+        "executable[number,fullDisplayName]]]]"
+    )
+    out = []
+    for node in data.get("computer", []):
+        for ex in node.get("executors", []):
+            ce = ex.get("currentExecutable")
+            if ce:
+                out.append({
+                    "node": node["displayName"],
+                    "number": ce["number"],
+                    "full": ce["fullDisplayName"],
+                    "url": ce["url"],
+                    "start": ce["timestamp"],
+                })
+    return out
+
+
+def console_len(client: JenkinsClient, url: str) -> int:
+    try:
+        txt = client._request("GET", url + "consoleText").text
+        return len(txt)
+    except JenkinsError:
+        return -1
+
+
+def build_path_from_url(url: str) -> tuple[str, int]:
+    # url: .../job/<name>/<number>/ — may be nested: /job/A/job/B/42/
+    parts = [p for p in url.split("/") if p]
+    # find numeric segment
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].isdigit():
+            num = int(parts[i])
+            job_parts = parts[parts.index("job") + 1:i]
+            name = "/".join(job_parts[1::2])  # skip 'job' separators
+            return name, num
+    raise ValueError(f"cannot parse {url}")
+
+
+def main() -> int:
+    client = JenkinsClient()
+    running = running_builds(client)
+    now = time.time() * 1000
+    result = {"ts": datetime.now(timezone.utc).isoformat(),
+              "running": len(running), "killed": [], "dry_run": DRY_RUN}
+
+    for b in running:
+        if b["full"] in EXCLUDE:
+            continue
+        runtime = (now - b["start"]) / 1000
+        if runtime <= MAX_RUNTIME_SEC:
+            continue
+        # extend by idle check
+        name, num = build_path_from_url(b["url"])
+        l1 = console_len(client, b["url"])
+        time.sleep(IDLE_POLL_SEC)
+        l2 = console_len(client, b["url"])
+        idle_growth = l2 - l1
+        entry = {
+            "job": name, "number": num, "node": b["node"],
+            "runtime_sec": int(runtime), "growth_bytes": idle_growth,
+        }
+        if idle_growth == 0:
+            entry["action"] = "kill_idle"
+        else:
+            entry["action"] = "kill_runtime"
+        if not DRY_RUN:
+            try:
+                client.stop_build(name, num)
+                entry["killed"] = True
+            except JenkinsError as e:
+                entry["killed"] = False
+                entry["error"] = str(e)
+        result["killed"].append(entry)
+
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+4.4 daily_disk_report.py — per-job disk usage via Groovy
+python
+
+#!/usr/bin/env python3
+"""
+daily_disk_report.py — per-job disk usage, sorted desc.
+
+Uses Groovy via /scriptText to walk jobs/*/builds/* on the controller.
+Requires Overall/Administer (same as the Jenkins UI disk report).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient
+
+GROOVY = r"""
+import hudson.model.*
+import groovy.json.JsonOutput
+
+def results = []
+Jenkins.instance.getAllItems(Job).each { job ->
+    def dir = job.getBuildDir()
+    long size = 0L
+    int files = 0
+    if (dir.exists()) {
+        dir.eachFileRecurse { f ->
+            if (f.isFile()) { size += f.length(); files++ }
+        }
+    }
+    results << [name: job.fullName, size_bytes: size, files: files]
+}
+println JsonOutput.toJson(results)
+"""
+
+TOP = int(os.getenv("TOP_N", "30"))
+THRESHOLD_GB = float(os.getenv("JOB_WARN_GB", "10"))
+
+
+def main() -> int:
+    client = JenkinsClient()
+    raw = client.run_groovy(GROOVY).strip()
+    # strip leading/trailing log noise
+    start = raw.find("[")
+    end = raw.rfind("]")
+    jobs = json.loads(raw[start:end + 1])
+    jobs.sort(key=lambda j: j["size_bytes"], reverse=True)
+
+    total = sum(j["size_bytes"] for j in jobs)
+    over = [j for j in jobs if j["size_bytes"] >= THRESHOLD_GB * 1024**3]
+
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "jobs": len(jobs),
+        "total_gb": round(total / 1024**3, 2),
+        "top": [
+            {"job": j["name"], "gb": round(j["size_bytes"] / 1024**3, 2), "files": j["files"]}
+            for j in jobs[:TOP]
+        ],
+        "over_threshold": [
+            {"job": j["name"], "gb": round(j["size_bytes"] / 1024**3, 2)}
+            for j in over
+        ],
+    }
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+4.5 daily_failed_builds.py — 24h failure report (Slack/email)
+python
+
+#!/usr/bin/env python3
+"""
+daily_failed_builds.py — report of failed builds in last N hours.
+
+Env:
+  WINDOW_HOURS   default 24
+  SLACK_WEBHOOK  optional; if set, posts a summary
+  SLACK_CHANNEL  optional
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+import requests
+
+from jenkins_client import JenkinsClient, JenkinsNotFound
+
+WINDOW_HOURS = int(os.getenv("WINDOW_HOURS", "24"))
+
+
+def all_jobs(client: JenkinsClient) -> list[str]:
+    """Flatten folders into 'folder/job' paths."""
+    out: list[str] = []
+
+    def walk(prefix: str, items: list[dict]) -> None:
+        for it in items:
+            name = it["name"]
+            full = f"{prefix}/{name}" if prefix else name
+            if it.get("_class", "").endswith("Folder"):
+                sub = client.get_json(f"/job/{prefix + '/' if prefix else ''}{name}/api/json?tree=jobs[name,_class]")["jobs"] if False else None
+                # Folder listing needs the folder URL:
+                sub = client.get_json(f"/{'job/' if not prefix else 'job/' + prefix + '/job/'}{name}/api/json?tree=jobs[name,_class]")["jobs"]
+                walk(full, sub)
+            else:
+                out.append(full)
+
+    root = client.get_json("/api/json?tree=jobs[name,_class]")["jobs"]
+    walk("", root)
+    return out
+
+
+def job_url(name: str) -> str:
+    parts = name.split("/")
+    return "/" + "/".join(f"job/{p}" for p in parts)
+
+
+def main() -> int:
+    client = JenkinsClient()
+    cutoff = (time.time() - WINDOW_HOURS * 3600) * 1000
+    failures = []
+
+    for name in all_jobs(client):
+        try:
+            url = job_url(name)
+            data = client.get_json(
+                f"{url}/api/json?tree=builds[number,result,timestamp,duration,url,displayName,"
+                f"actions[causes[shortDescription]]]{{0,50}}"
+            )
+        except JenkinsNotFound:
+            continue
+        for b in data.get("builds", []):
+            if b.get("timestamp", 0) < cutoff:
+                continue
+            if b.get("result") not in ("FAILURE", "UNSTABLE"):
+                continue
+            cause = "unknown"
+            for a in b.get("actions", []):
+                for c in a.get("causes", []) or []:
+                    cause = c.get("shortDescription", cause)
+            failures.append({
+                "job": name, "number": b["number"], "result": b["result"],
+                "ts": datetime.fromtimestamp(b["timestamp"] / 1000, tz=timezone.utc).isoformat(),
+                "duration_sec": int(b["duration"] / 1000),
+                "url": b["url"], "cause": cause,
+            })
+
+    failures.sort(key=lambda f: f["ts"], reverse=True)
+    result = {"window_hours": WINDOW_HOURS, "count": len(failures), "failures": failures}
+    print(json.dumps(result, indent=2))
+
+    # Slack summary
+    webhook = os.getenv("SLACK_WEBHOOK")
+    if webhook and failures:
+        lines = [f"*Jenkins failures (last {WINDOW_HOURS}h): {len(failures)}*"]
+        for f in failures[:20]:
+            lines.append(f"• `{f['job']} #{f['number']}` — {f['result']} — <{f['url']}|log>")
+        payload = {
+            "text": "\n".join(lines),
+            "channel": os.getenv("SLACK_CHANNEL", "#ci"),
+            "username": "jenkins-bot",
+        }
+        r = requests.post(webhook, json=payload, timeout=10)
+        r.raise_for_status()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+4.6 daily_agent_report.py — offline agents + reason
+python
+
+#!/usr/bin/env python3
+"""daily_agent_report.py — nodes offline, executors in use, disk on agents."""
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient
+
+
+def main() -> int:
+    c = JenkinsClient()
+    nodes = c.nodes()
+    out = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "total": len(nodes),
+        "executors_total": sum(n["numExecutors"] for n in nodes),
+        "online": 0, "offline": [],
+    }
+    for n in nodes:
+        if n["offline"]:
+            out["offline"].append({
+                "name": n["displayName"],
+                "reason": n.get("offlineCauseReason", ""),
+                "temporary": n.get("temporarilyOffline", False),
+            })
+        else:
+            out["online"] += 1
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+4.7 Daily crontab (one file)
+cron
+
+# /etc/cron.d/jenkins-ops  — user: ops
+SHELL=/bin/bash
+PATH=/opt/jenkins-ops/venv/bin:/usr/local/bin:/usr/bin:/bin
+JENKINS_URL=https://jenkins.example.com
+JENKINS_USER=ops-automation
+# JENKINS_TOKEN is in /etc/jenkins-ops/env — sources by systemd timers.
+# For raw cron, put it in /etc/jenkins-ops/env and `set -a; . /etc/jenkins-ops/env; set +a;`
+
+*/2 * * * *  ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_health.py           >> /var/log/jenkins-checks/health.log    2>&1
+*/10 * * * * ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_queue_cleanup.py     >> /var/log/jenkins-checks/queue.log     2>&1
+*/15 * * * * ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_stuck_build_killer.py >> /var/log/jenkins-checks/stuck.log    2>&1
+0 3 * * *    ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_disk_report.py       >> /var/log/jenkins-checks/disk.log      2>&1
+0 7 * * *    ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_failed_builds.py     >> /var/log/jenkins-checks/failed.log    2>&1
+0 8 * * *    ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/daily_agent_report.py      >> /var/log/jenkins-checks/agents.log    2>&1
+
+Part 5 — Weekly Automation
+5.1 weekly_inventory.py — full inventory snapshot
+python
+
+#!/usr/bin/env python3
+"""
+weekly_inventory.py — snapshot of jobs, plugins, agents, credentials (metadata).
+
+Writes a single JSON to /var/log/jenkins-checks/inventory-YYYY-WW.json
+and prints a summary.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient
+
+OUT_DIR = os.getenv("INV_DIR", "/var/log/jenkins-checks/inventory")
+
+
+def main() -> int:
+    os.makedirs(OUT_DIR, exist_ok=True)
+    c = JenkinsClient()
+    now = datetime.now(timezone.utc)
+    inv = {
+        "ts": now.isoformat(),
+        "version": c.version(),
+        "mode": c.mode(),
+        "jobs": c.jobs(),
+        "plugins": c.plugins(),
+        "nodes": c.nodes(),
+        "credentials": c.get_json(
+            "/credentials/store/system/domain/_/api/json"
+            "?tree=credentials[id,typeName,description]"
+        )["credentials"],
+    }
+    path = os.path.join(OUT_DIR, f"inventory-{now.strftime('%Y-W%V')}.json")
+    with open(path, "w") as f:
+        json.dump(inv, f, indent=2)
+    print(json.dumps({
+        "path": path,
+        "jobs": len(inv["jobs"]),
+        "plugins": len(inv["plugins"]),
+        "nodes": len(inv["nodes"]),
+        "credentials": len(inv["credentials"]),
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+5.2 weekly_plugin_drift.py — compare installed vs git-pinned
+python
+
+#!/usr/bin/env python3
+"""
+weekly_plugin_drift.py — compare installed plugins to pinned manifest.
+
+Manifest format (plugins.txt, one per line):
+    git:5.7.0
+    kubernetes:4287.v98a_8f9b_2a_1d
+    # comments allowed
+
+Exit:
+  0 = no drift
+  1 = drift (missing, extra, or version mismatch)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient
+
+MANIFEST = os.getenv("PLUGINS_MANIFEST", "/opt/jenkins-ops/plugins.txt")
+
+
+def parse_manifest(path: str) -> dict[str, str]:
+    want = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                name, ver = line.split(":", 1)
+                want[name.strip()] = ver.strip()
+            else:
+                want[line] = "*"
+    return want
+
+
+def main() -> int:
+    c = JenkinsClient()
+    installed = {p["shortName"]: p["version"] for p in c.plugins() if p["enabled"]}
+    want = parse_manifest(MANIFEST)
+
+    missing = [k for k in want if k not in installed]
+    extra = [k for k in installed if k not in want]
+    mismatch = [
+        {"name": k, "want": want[k], "have": installed[k]}
+        for k in want
+        if k in installed and want[k] != "*" and want[k] != installed[k]
+    ]
+
+    drift = bool(missing or extra or mismatch)
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "drift": drift,
+        "missing": missing,
+        "extra": extra,
+        "version_mismatch": mismatch,
+    }
+    print(json.dumps(result, indent=2))
+    return 1 if drift else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+5.3 weekly_backup_verify.py — checksum + restore-test
+python
+
+#!/usr/bin/env python3
+"""
+weekly_backup_verify.py — verify latest Jenkins backup can be restored.
+
+Steps:
+  1. Locate latest jenkins-*.tgz in BACKUP_DIR
+  2. Verify tarball integrity (tar -tzf) and content list
+  3. Extract to a scratch dir and validate required files
+  4. Verify SHA256 manifest if present
+"""
+from __future__ import annotations
+
+import glob
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/var/backups/jenkins")
+REQUIRED = {
+    "config.xml",
+    "credentials.xml",
+    "secret.key",
+    "identity.key.enc",
+}
+
+
+def find_latest() -> str | None:
+    files = sorted(glob.glob(os.path.join(BACKUP_DIR, "jenkins-*.tgz")))
+    return files[-1] if files else None
+
+
+def sha256_of(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def main() -> int:
+    path = find_latest()
+    if not path:
+        print(json.dumps({"ok": False, "error": "no_backup_found", "dir": BACKUP_DIR}))
+        return 2
+    result = {"file": path, "size_mb": round(os.path.getsize(path) / 1024**2, 1)}
+    result["sha256"] = sha256_of(path)
+
+    # 1. tar integrity
+    try:
+        with tarfile.open(path) as tf:
+            names = tf.getnames()
+            result["entries"] = len(names)
+    except tarfile.TarError as e:
+        result.update({"ok": False, "error": f"tar_integrity: {e}"})
+        print(json.dumps(result, indent=2))
+        return 2
+
+    # 2. required files
+    present = {r for r in REQUIRED if r in names}
+    missing = sorted(REQUIRED - present)
+    result["missing_required"] = missing
+
+    # 3. extract + validate XML parse
+    with tempfile.TemporaryDirectory() as td:
+        with tarfile.open(path) as tf:
+            tf.extractall(td)
+        bad = []
+        for name in present:
+            full = os.path.join(td, name)
+            if not os.path.isfile(full):
+                bad.append({"file": name, "error": "not_a_file"})
+                continue
+            if name.endswith(".xml"):
+                p = subprocess.run(["xmllint", "--noout", full], capture_output=True)
+                if p.returncode != 0:
+                    bad.append({"file": name, "error": "invalid_xml"})
+        result["xml_errors"] = bad
+
+    result["ok"] = not missing and not result["xml_errors"]
+    result["ts"] = datetime.now(timezone.utc).isoformat()
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+5.4 weekly_trends.py — success rate + duration p95
+python
+
+#!/usr/bin/env python3
+"""
+weekly_trends.py — 7-day build success rate and duration p95 per job.
+
+Skips jobs with <5 builds/week. Emits JSON for Grafana, and optionally
+pushes to a Prometheus pushgateway.
+"""
+from __future__ import annotations
+
+import json
+import os
+import statistics
+import sys
+import time
+from datetime import datetime, timezone
+
+from jenkins_client import JenkinsClient
+
+WINDOW_HOURS = int(os.getenv("WINDOW_HOURS", str(7 * 24)))
+PUSHGATEWAY = os.getenv("PUSHGATEWAY_URL")
+
+
+def all_jobs(client: JenkinsClient) -> list[str]:
+    def walk(items):
+        for it in items:
+            if it.get("_class", "").endswith("Folder"):
+                sub = client.get_json(
+                    f"/job/{it['name']}/api/json?tree=jobs[name,_class]"
+                )["jobs"]
+                yield from (it["name"] + "/" + s for s in walk(sub))
+            else:
+                yield it["name"]
+    yield from walk(client.get_json("/api/json?tree=jobs[name,_class]")["jobs"])
+
+
+def main() -> int:
+    c = JenkinsClient()
+    cutoff = (time.time() - WINDOW_HOURS * 3600) * 1000
+    rows = []
+    for name in all_jobs(c):
+        try:
+            url = "/" + "/".join(f"job/{p}" for p in name.split("/"))
+            data = c.get_json(
+                f"{url}/api/json?tree=builds[number,result,timestamp,duration]{{0,200}}"
+            )
+        except Exception:
+            continue
+        builds = [b for b in data.get("builds", [])
+                  if b.get("timestamp", 0) >= cutoff and b.get("result")]
+        if len(builds) < 5:
+            continue
+        total = len(builds)
+        ok = sum(1 for b in builds if b["result"] == "SUCCESS")
+        durs = sorted(b["duration"] / 1000 for b in builds if b["duration"])
+        p95 = durs[int(0.95 * len(durs)) - 1] if durs else 0
+        rows.append({
+            "job": name, "builds": total, "success": ok,
+            "success_rate": round(ok / total, 3),
+            "p50_sec": int(statistics.median(durs)) if durs else 0,
+            "p95_sec": int(p95),
+        })
+    rows.sort(key=lambda r: r["success_rate"])
+
+    out = {"ts": datetime.now(timezone.utc).isoformat(),
+           "window_hours": WINDOW_HOURS, "jobs": rows}
+    print(json.dumps(out, indent=2))
+
+    if PUSHGATEWAY:
+        lines = []
+        for r in rows:
+            labels = f'job="{r["job"]}"'
+            lines.append(f'jenkins_build_success_rate{{{labels}}} {r["success_rate"]}')
+            lines.append(f'jenkins_build_duration_p95_seconds{{{labels}}} {r["p95_sec"]}')
+        body = "\n".join(lines) + "\n"
+        import requests
+        requests.post(f"{PUSHGATEWAY}/metrics/job/jenkins_trends", data=body, timeout=10)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+5.5 weekly_credential_audit.py — age + token hygiene
+python
+
+#!/usr/bin/env python3
+"""
+weekly_credential_audit.py — flag credentials / API tokens older than N days.
+
+Jenkins does not expose token creation timestamps over REST; use:
+  - /user/<u>/api/json?tree=... (no timestamps)
+  - filesystem: users/<u>/config.xml contains API token hashes, not age.
+Practical approach:
+  - Track creation date yourself in an external CSV / DB.
+  - Or compare against last-known inventory (weekly_inventory.py output).
+This script compares credential IDs across two inventory snapshots and
+flags *new* and *removed* credentials — useful for change tracking.
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import sys
+
+INV_DIR = os.getenv("INV_DIR", "/var/log/jenkins-checks/inventory")
+
+
+def load_latest_two() -> tuple[dict, dict]:
+    files = sorted(glob.glob(os.path.join(INV_DIR, "inventory-*.json")))
+    if len(files) < 2:
+        raise SystemExit("need at least 2 inventory snapshots")
+    with open(files[-2]) as f: prev = json.load(f)
+    with open(files[-1]) as f: cur = json.load(f)
+    return prev, cur
+
+
+def ids(inv: dict) -> set[str]:
+    return {c["id"] for c in inv.get("credentials", [])}
+
+
+def main() -> int:
+    prev, cur = load_latest_two()
+    p, c = ids(prev), ids(cur)
+    out = {
+        "added": sorted(c - p),
+        "removed": sorted(p - c),
+        "count": len(c),
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+5.6 Weekly crontab
+cron
+
+# Sunday 03:00–05:00
+0 3 * * 0  ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/weekly_inventory.py       >> /var/log/jenkins-checks/weekly.log 2>&1
+30 3 * * 0 ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/weekly_plugin_drift.py    >> /var/log/jenkins-checks/weekly.log 2>&1
+0 4 * * 0  ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/weekly_backup_verify.py   >> /var/log/jenkins-checks/weekly.log 2>&1
+30 4 * * 0 ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/weekly_trends.py          >> /var/log/jenkins-checks/weekly.log 2>&1
+0 5 * * 0  ops  /opt/jenkins-ops/venv/bin/python /opt/jenkins-ops/weekly_credential_audit.py >> /var/log/jenkins-checks/weekly.log 2>&1
+
+Part 6 — Python Inside Jenkins Pipelines
+
+Python runs on the agent, inside a stage. Three sub-patterns:
+6.1 Python project's CI (pytest + coverage + lint)
+groovy
+
+pipeline {
+  agent { docker { image 'python:3.12-slim'; args '-u root' } }
+
+  stages {
+    stage('Setup') {
+      steps {
+        sh 'python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt -r requirements-dev.txt'
+      }
+    }
+    stage('Lint') {
+      steps {
+        sh '. .venv/bin/activate && ruff check . && black --check .'
+      }
+    }
+    stage('Test') {
+      steps {
+        sh '''
+          set -eu
+          . .venv/bin/activate
+          pytest --junitxml=reports/junit.xml --cov=myapp --cov-report=xml:reports/coverage.xml
+        '''
+      }
+      post {
+        always {
+          junit 'reports/junit.xml'
+          recordCoverage tools: [[parser: 'COBERTURA', pattern: 'reports/coverage.xml']]
+        }
+      }
+    }
+    stage('Security') {
+      steps {
+        sh '. .venv/bin/activate && bandit -r myapp -f json -o reports/bandit.json || true'
+      }
+      post { always { recordIssues tools: [pyLint(), bandit(pattern: 'reports/bandit.json')] } }
+    }
+    stage('Package') {
+      steps {
+        sh '. .venv/bin/activate && python -m build && twine check dist/*'
+        archiveArtifacts artifacts: 'dist/*.whl,dist/*.tar.gz', fingerprint: true
+      }
+    }
+  }
+}
+
+6.2 Deploy script driven by sh 'python …'
+
+deploy.py (lives in the repo, tested separately):
+python
+
+#!/usr/bin/env python3
+"""deploy.py — idempotent k8s deploy driven by env vars set by Jenkins."""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+
+NAMESPACE = os.environ["DEPLOY_NS"]
+DEPLOYMENT = os.environ["DEPLOY_NAME"]
+IMAGE = os.environ["IMAGE_REF"]
+TIMEOUT = int(os.environ.get("DEPLOY_TIMEOUT", "600"))
+
+
+def sh(*cmd: str) -> str:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr)
+        raise SystemExit(p.returncode)
+    return p.stdout
+
+
+def main() -> int:
+    print(f"deploying {DEPLOYMENT} → {IMAGE} in {NAMESPACE}")
+    sh("kubectl", "-n", NAMESPACE, "set", "image",
+       f"deploy/{DEPLOYMENT}", f"app={IMAGE}")
+    sh("kubectl", "-n", NAMESPACE, "rollout", "status",
+       f"deploy/{DEPLOYMENT}", f"--timeout={TIMEOUT}s")
+    print("deploy OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+groovy
+
+stage('Deploy') {
+  environment {
+    DEPLOY_NS   = 'prod'
+    DEPLOY_NAME = 'my-service'
+    IMAGE_REF   = "registry.example.com/my-service:${env.IMAGE_TAG}"
+  }
+  steps {
+    withCredentials([file(credentialsId: 'kubeconfig-prod', variable: 'KUBECONFIG')]) {
+      sh 'python deploy.py'
+    }
+  }
+}
+
+6.3 Python pipeline helper (report generation, notifications)
+groovy
+
+stage('Notify') {
+  steps {
+    withCredentials([string(credentialsId: 'slack-token', variable: 'SLACK_TOKEN')]) {
+      sh '''
+        python - <<"PY"
+import os, json, urllib.request
+msg = {
+  "channel": "#ci",
+  "text": f"Deploy {os.environ['JOB_NAME']} #{os.environ['BUILD_NUMBER']} → {os.environ['ENV']} OK",
+}
+req = urllib.request.Request(
+    "https://slack.com/api/chat.postMessage",
+    data=json.dumps(msg).encode(),
+    headers={"Authorization": f"Bearer {os.environ['SLACK_TOKEN']}",
+             "Content-Type": "application/json"},
+)
+urllib.request.urlopen(req).read()
+PY
+      '''
+    }
+  }
+}
+
+Part 7 — Advanced Patterns
+7.1 Webhook bridge (Pattern 5) — Flask receiver
+
+Receives GitHub/GitLab/Sonar webhooks, applies policy, triggers Jenkins with parameters.
+python
+
+#!/usr/bin/env python3
+"""
+webhook_bridge.py — receive webhooks → trigger Jenkins builds.
+
+Endpoints:
+  POST /github    — GitHub push/PR events
+  POST /sonar     — SonarQube webhook (gate result)
+  GET  /healthz
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+
+from flask import Flask, abort, jsonify, request
+
+from jenkins_client import JenkinsClient
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bridge")
+
+app = Flask(__name__)
+jenkins = JenkinsClient()
+
+GH_SECRET = os.environ.get("GH_WEBHOOK_SECRET", "").encode()
+JOB_MAP = json.loads(os.environ.get("JOB_MAP", "{}"))
+
+
+def verify_gh(payload: bytes, sig: str | None) -> None:
+    if not GH_SECRET:
+        return
+    if not sig:
+        abort(401, "missing signature")
+    expected = "sha256=" + hmac.new(GH_SECRET, payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        abort(401, "bad signature")
+
+
+@app.post("/github")
+def github():
+    raw = request.get_data()
+    verify_gh(raw, request.headers.get("X-Hub-Signature-256"))
+    event = request.headers.get("X-GitHub-Event", "")
+    body = json.loads(raw)
+    repo = body.get("repository", {}).get("full_name", "")
+    job = JOB_MAP.get(repo)
+    if not job:
+        return jsonify({"skipped": True, "reason": "no mapping"}), 200
+
+    if event == "push":
+        branch = body["ref"].replace("refs/heads/", "")
+        params = {"BRANCH": branch, "COMMIT": body["after"]}
+    elif event == "pull_request":
+        params = {"PR": str(body["number"]), "BRANCH": body["pull_request"]["head"]["ref"]}
+    else:
+        return jsonify({"skipped": True, "event": event}), 200
+
+    log.info("triggering %s %s", job, params)
+    jenkins.build(job, params)
+    return jsonify({"triggered": job, "params": params}), 202
+
+
+@app.post("/sonar")
+def sonar():
+    body = request.get_json(force=True)
+    job = JOB_MAP.get(f"sonar:{body['project']['key']}")
+    if not job:
+        return jsonify({"skipped": True}), 200
+    status = body["qualityGate"]["status"]
+    jenkins.build(job, {"GATE": status, "PROJECT": body["project"]["key"]})
+    return jsonify({"triggered": job, "gate": status}), 202
+
+
+@app.get("/healthz")
+def healthz():
+    try:
+        jenkins.whoami()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8081)
+
+7.2 Orchestration — Python triggers Jenkins, waits, pulls artifact
+python
+
+#!/usr/bin/env python3
+"""
+orchestrator.py — trigger a multi-stage release and gate on results.
+
+Reads stages from a config file, triggers each Jenkins job, waits for it,
+downloads artifacts, and fails-fast on any non-SUCCESS.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+from jenkins_client import JenkinsClient, JenkinsError
+
+STAGES = [
+    {"job": "build-service", "params": {"BRANCH": "main"}},
+    {"job": "test-service", "params": {"BRANCH": "main"}},
+    {"job": "deploy-staging", "params": {"VERSION": "auto"}},
+    {"job": "e2e-staging", "params": {}},
+]
+
+
+def main() -> int:
+    c = JenkinsClient()
+    results = []
+    for st in STAGES:
+        job = st["job"]
+        print(f"→ trigger {job} {st['params']}")
+        c.build(job, st["params"], wait=False)
+        num = c.wait_for_completion(job, poll=5, timeout=3600)
+        info = c.build_info(job, num)
+        results.append({"job": job, "number": num, "result": info["result"],
+                        "url": info["url"]})
+        if info["result"] != "SUCCESS":
+            print(json.dumps(results, indent=2))
+            return 1
+        for a in info.get("artifacts", []):
+            dst = os.path.join("artifacts", job, a["fileName"])
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            c.download_artifact(job, num, a["relativePath"], dst)
+            print(f"  artifact → {dst}")
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+7.3 Multi-branch trigger from GitHub Actions / GitLab CI
+
+In GitHub Actions, replace jenkins-plugin style with a raw call:
+yaml
+
+# .github/workflows/ci.yml
+- name: Trigger Jenkins
+  env:
+    JENKINS_URL:   ${{ secrets.JENKINS_URL }}
+    JENKINS_USER:  ${{ secrets.JENKINS_USER }}
+    JENKINS_TOKEN: ${{ secrets.JENKINS_TOKEN }}
+  run: |
+    python - <<'PY'
+    import os, requests
+    base = os.environ["JENKINS_URL"].rstrip("/")
+    s = requests.Session()
+    s.auth = (os.environ["JENKINS_USER"], os.environ["JENKINS_TOKEN"])
+    crumb = s.get(f"{base}/crumbIssuer/api/json").json()
+    s.post(
+        f"{base}/job/build-service/buildWithParameters",
+        params={"BRANCH": os.environ["GITHUB_REF_NAME"], "COMMIT": os.environ["GITHUB_SHA"]},
+        headers={crumb["crumbRequestField"]: crumb["crumb"]},
+    ).raise_for_status()
+    PY
+
+7.4 Concurrency control from Python — one build per parameter set
+python
+
+#!/usr/bin/env python3
+"""
+single_flight.py — cancel duplicate queue items / running builds for the same
+(job, params) tuple, then trigger one.
+"""
+import hashlib
+import json
+import sys
+import time
+
+from jenkins_client import JenkinsClient
+
+
+def fingerprint(job: str, params: dict) -> str:
+    return hashlib.sha256(
+        (job + json.dumps(sorted(params.items()))).encode()
+    ).hexdigest()
+
+
+def main() -> int:
+    job = sys.argv[1]
+    params = dict(a.split("=", 1) for a in sys.argv[2:])
+    c = JenkinsClient()
+
+    fp = fingerprint(job, params)
+    # 1. cancel matching queue items
+    for item in c.queue():
+        if item["task"]["name"] != job:
+            continue
+        iparams = {p["name"]: p["value"] for p in item.get("params", [])}
+        if fingerprint(job, iparams) == fp:
+            c.cancel_queue_item(item["id"])
+
+    # 2. wait for any running build of the same fp to finish
+    lb = c.last_build(job)
+    if lb and lb.get("building"):
+        c.wait_for_completion(job, poll=5, timeout=1800)
+
+    # 3. trigger
+    c.build(job, params)
+    print(json.dumps({"ok": True, "job": job, "params": params}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+Part 8 — Production Practices
+8.1 Configuration & secrets
+bash
+
+# /etc/jenkins-ops/env  (chmod 600, owner ops)
+JENKINS_URL=https://jenkins.example.com
+JENKINS_USER=ops-automation
+JENKINS_TOKEN=...
+JENKINS_CA_BUNDLE=/etc/ssl/certs/corp-ca.pem
+SLACK_WEBHOOK=https://hooks.slack.com/services/...
+DRY_RUN=false
+
+Load in cron:
+bash
+
+set -a; . /etc/jenkins-ops/env; set +a
+
+Load via systemd: EnvironmentFile=/etc/jenkins-ops/env.
+
+Never put the token in code, Jenkinsfile, git, or ps-visible -e. Prefer Vault:
+python
+
+# secrets.py
+import os
+import hvac
+
+def get_jenkins_token() -> str:
+    if "JENKINS_TOKEN" in os.environ:
+        return os.environ["JENKINS_TOKEN"]
+    client = hvac.Client(url=os.environ["VAULT_ADDR"])
+    client.auth.approle.login(
+        role_id=os.environ["VAULT_ROLE_ID"],
+        secret_id=os.environ["VAULT_SECRET_ID"],
+    )
+    return client.secrets.kv.v2.read_secret_version(
+        path="ci/jenkins", mount_point="kv"
+    )["data"]["data"]["token"]
+
+8.2 Rate limiting
+
+Every call goes through RateLimiter. For batch operations across 1000 jobs:
+python
+
+from jenkins_client import JenkinsClient
+c = JenkinsClient(rate=3.0)     # 3 req/s
+for name in jobs:
+    c.job_info(name)            # paced automatically
+
+Never call Jenkins in a tight loop without pacing — a 5000-job inventory at 50 req/s will saturate a controller.
+8.3 Retry semantics
+Operation	Retries	Why
+GET (idempotent)	3	safe to retry
+POST /build	0 (or idempotency via cancel-if-duplicate)	double-trigger is worse than a missed one
+POST /queue/cancelItem	0	item may already be gone
+POST /reload	1	second call may race
+POST /scriptText	0	side effects unknown
+
+The client's Retry only applies GET/HEAD by default — POST is allowed here because many POSTs (cancel, disable) are idempotent; override per call if not:
+python
+
+c._request("POST", path, ...)   # bypass retry by using a fresh Session if needed
+
+8.4 Structured logging
+python
+
+import json, logging, sys
+
+class JsonFormatter(logging.Formatter):
+    def format(self, r):
+        return json.dumps({
+            "ts": self.formatTime(r, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": r.levelname,
+            "logger": r.name,
+            "msg": r.getMessage(),
+            **({"exc": self.formatException(r.exc_info)} if r.exc_info else {}),
+        })
+
+h = logging.StreamHandler(sys.stdout)
+h.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[h])
+
+Ship to Loki/ELK; alert on "level":"ERROR".
+8.5 Exit codes (cron semantics)
+Code	Meaning	Action
+0	OK	—
+1	Degraded	page on-call if ≥ 3 consecutive
+2	Down	page immediately
+3	Misconfigured (bad env)	fix config
+
+Cron + alert wrapper:
+bash
+
+#!/bin/bash
+# /usr/local/bin/run-check.sh
+set -u
+script="$1"
+out=$(/opt/jenkins-ops/venv/bin/python "$script" 2>&1)
+rc=$?
+echo "$out" | logger -t "jenkins-check:$script"
+if [ $rc -ge 2 ]; then
+  curl -fsS -X POST "$ALERT_WEBHOOK" \
+    -H 'Content-Type: application/json' \
+    -d "{\"text\":\"$script returned $rc\"}"
+fi
+exit $rc
+
+8.6 Testing the scripts
+python
+
+# test_jenkins_client.py
+import responses
+from jenkins_client import JenkinsClient
+
+@responses.activate
+def test_whoami():
+    responses.get("https://j.example.com/whoAmI/api/json",
+                  json={"name": "ops", "authenticated": True})
+    c = JenkinsClient(url="https://j.example.com", user="u", token="t",
+                      verify=False)
+    assert c.whoami()["authenticated"] is True
+
+@responses.activate
+def test_crumb_post():
+    responses.get("https://j.example.com/crumbIssuer/api/json",
+                  json={"crumbRequestField": "Jenkins-Crumb", "crumb": "abc"})
+    responses.post("https://j.example.com/quietDown", status=200)
+    c = JenkinsClient(url="https://j.example.com", user="u", token="t",
+                      verify=False)
+    c.quiet_down()
+    assert responses.calls[-1].request.headers["Jenkins-Crumb"] == "abc"
+
+bash
+
+pytest -q test_jenkins_client.py
+
+8.7 Observability of the automation itself
+
+Wrap every script with a Prometheus push of last_success_timestamp:
+python
+
+import time
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+
+def instrument(script_name: str, gateway: str):
+    g = Gauge("jenkins_ops_last_success_timestamp",
+              "unix ts of last success", ["script"],
+              registry=CollectorRegistry())
+    def mark():
+        g.labels(script=script_name).set(time.time())
+        push_to_gateway(gateway, job="jenkins-ops", registry=g._registry)
+    return mark
+
+Then alert: time() - jenkins_ops_last_success_timestamp{script="daily_health.py"} > 600.
+8.8 What to run daily vs weekly (final table)
+Frequency	Script	Purpose	Alert severity
+2 min	daily_health.py	Liveness/readiness, agents, queue, disk	critical on rc=2
+10 min	daily_queue_cleanup.py	Cancel stale/dup queue items	info only
+15 min	daily_stuck_build_killer.py	Abort idle/hung builds	info
+daily 03:00	daily_disk_report.py	Per-job disk usage	warn > 10 GB/job
+daily 07:00	daily_failed_builds.py	24h failure report → Slack	—
+daily 08:00	daily_agent_report.py	Offline agents	warn
+weekly Sun 03:00	weekly_inventory.py	Full snapshot	—
+weekly Sun 03:30	weekly_plugin_drift.py	Manifest vs installed	warn on drift
+weekly Sun 04:00	weekly_backup_verify.py	Tarball integrity + restore test	critical
+weekly Sun 04:30	weekly_trends.py	Success rate + p95 → Pushgateway	—
+weekly Sun 05:00	weekly_credential_audit.py	Credential churn	info
+8.9 Golden rules for Python ↔ Jenkins in production
+
+    Never hardcode URL, user, or token — env or Vault.
+
+    Rate-limit yourself — 3–5 req/s per controller; batch jobs in parallel only if you're sure.
+
+    Retry only GET/HEAD by default; POSTs need idempotency design (cancel-if-duplicate).
+
+    Emit JSON from every script so you can pipe to jq, Loki, or a metrics sink.
+
+    Exit codes are your alert contract — 0 OK, 1 degraded, 2 down.
+
+    Never print secrets — withCredentials inside Jenkins, withVault outside.
+
+    Test the scripts with responses — don't test against prod Jenkins.
+
+    Bound every call — timeout=30, poll=5, timeout=3600 in waits.
+
+    Log structured JSON — {"ts", "level", "script", "job", "reason"}.
+
+    Dry-run mode for destructive actions (DRY_RUN=true) — enforce in staging.
+
+    One API token per automation — never share with a human; rotate quarterly.
+
+    Instrument the automation itself — last_success_timestamp per script.
+
+    Use numExecutors: 0 + agents — Python deploy scripts run on agents, never the controller.
+
+    Pin Python deps in a requirements.txt with hashes; deploy in a venv under /opt/jenkins-ops/venv.
+
+    Keep the scripts in the same git repo as the Jenkinsfile — same review, same CI.
+
+Quick-Reference Card
+bash
+
+# env
+export JENKINS_URL=https://jenkins.example.com
+export JENKINS_USER=ops-automation
+export JENKINS_TOKEN=...
+
+# daily
+python daily_health.py            | jq .checks
+python daily_queue_cleanup.py     | jq '.cancelled | length'
+python daily_stuck_build_killer.py
+python daily_disk_report.py       | jq '.top[:10]'
+python daily_failed_builds.py
+python daily_agent_report.py
+
+# weekly
+python weekly_inventory.py
+python weekly_plugin_drift.py
+python weekly_backup_verify.py
+python weekly_trends.py
+python weekly_credential_audit.py
+
+# one-off orchestration
+python orchestrator.py
+
+This is the complete operational picture: a reusable client, five daily scripts, five weekly scripts, Python inside pipelines, webhook bridges, orchestration, structured logging, exit-code alerting, secret hygiene, rate limiting, retries, testing, and a cron/timer layout — everything a DevOps engineer needs to run Python against Jenkins safely at scale.
